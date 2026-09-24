@@ -1,0 +1,6 @@
+{
+  "llm_roots": ["G:/ComfyUI/ComfyUI/models/LLM"],
+  "ninfer_api_base": "http://127.0.0.1:8080/v1",
+  "ffmpeg": "ffmpeg",
+  "request_timeout_seconds": 600
+}

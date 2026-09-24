@@ -1,0 +1,2 @@
+engine/**/*.exe filter=lfs diff=lfs merge=lfs -text
+engine/**/*.dll filter=lfs diff=lfs merge=lfs -text
