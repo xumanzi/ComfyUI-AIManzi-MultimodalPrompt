@@ -31,23 +31,29 @@ function refreshLayout(node) {
     app.graph.setDirtyCanvas(true, true);
 }
 
-function syncNInferUI(node) {
+function syncInferenceUI(node) {
     // Workflows saved before the mmproj rename can retain the former widget client-side.
     // Rename it in place so old graphs do not show an orphaned control after reload.
     const legacy = getWidget(node, "多模态辅助模型");
     if (legacy && !getWidget(node, "mmproj")) legacy.name = "mmproj";
     if (legacy && getWidget(node, "mmproj") !== legacy) setWidgetVisible(node, "多模态辅助模型", false);
+    const online = getWidget(node, "推理方式")?.value === "在线推理";
+    ["在线_API_URL", "在线_API_Key", "在线_模型_ID"].forEach((name) => setWidgetVisible(node, name, online));
+    ["启用_ninfer", "启用思考模式", "推理后卸载模型", "模型"].forEach(
+        (name) => setWidgetVisible(node, name, !online),
+    );
     const enabled = !!getWidget(node, "启用_ninfer")?.value;
-    setWidgetVisible(node, "mmproj", !enabled);
+    setWidgetVisible(node, "mmproj", !online && !enabled);
     const model = getWidget(node, "模型");
-    if (!model || !Array.isArray(model.options?.values)) return;
-    if (!model.__allModels) model.__allModels = [...model.options.values];
-    const filtered = model.__allModels.filter((value) => enabled ? value.toLowerCase().endsWith(".ninfer") : !value.toLowerCase().endsWith(".ninfer"));
-    const actualModels = filtered.filter((value) => value !== "自动匹配");
-    model.options.values = filtered.length ? filtered : ["未找到模型"];
-    // Repair a workflow saved while the old mmproj/model widgets were misaligned.
-    if (model.value === "自动匹配" && actualModels.length) model.value = actualModels[0];
-    if (!model.options.values.includes(model.value)) model.value = actualModels[0] ?? model.options.values[0];
+    if (model && Array.isArray(model.options?.values)) {
+        if (!model.__allModels) model.__allModels = [...model.options.values];
+        const filtered = model.__allModels.filter((value) => enabled ? value.toLowerCase().endsWith(".ninfer") : !value.toLowerCase().endsWith(".ninfer"));
+        const actualModels = filtered.filter((value) => value !== "自动匹配");
+        model.options.values = filtered.length ? filtered : ["未找到模型"];
+        // Repair a workflow saved while the old mmproj/model widgets were misaligned.
+        if (model.value === "自动匹配" && actualModels.length) model.value = actualModels[0];
+        if (!model.options.values.includes(model.value)) model.value = actualModels[0] ?? model.options.values[0];
+    }
     refreshLayout(node);
 }
 
@@ -113,12 +119,20 @@ app.registerExtension({
             return;
         }
         if (node.comfyClass !== NODE) return;
+        const inferenceMode = getWidget(node, "推理方式");
+        if (inferenceMode) {
+            const previousMode = inferenceMode.callback;
+            inferenceMode.callback = (...args) => {
+                previousMode?.(...args);
+                queueMicrotask(() => syncInferenceUI(node));
+            };
+        }
         const ninfer = getWidget(node, "启用_ninfer");
         if (ninfer) {
             const previous = ninfer.callback;
             ninfer.callback = (...args) => {
                 previous?.(...args);
-                queueMicrotask(() => syncNInferUI(node));
+                queueMicrotask(() => syncInferenceUI(node));
             };
         }
         const prior = node.onConnectionsChange;
@@ -126,7 +140,7 @@ app.registerExtension({
             prior?.apply(node, args);
             queueMicrotask(() => dynamicImageInputs(node));
         };
-        syncNInferUI(node);
+        syncInferenceUI(node);
         dynamicImageInputs(node);
         orderMediaInputs(node);
         requestAnimationFrame(() => refreshLayout(node));

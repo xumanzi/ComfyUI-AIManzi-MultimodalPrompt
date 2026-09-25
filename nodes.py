@@ -209,11 +209,16 @@ def _resolve_mmproj(choice: str, model: Path) -> Path | None:
     return _resolve_choice(choice, _mmproj_files(), "mmproj")
 
 
-def _json_request(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
+def _json_request(
+    url: str, body: dict[str, Any], timeout: int, headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     try:
@@ -647,7 +652,12 @@ def _resize_media_to_budget(
 
 
 def _api_chat(
-    api_base: str, model: str, instruction: str, image_urls: list[str], allow_reasoning: bool = False,
+    api_base: str,
+    model: str,
+    instruction: str,
+    image_urls: list[str],
+    allow_reasoning: bool = False,
+    api_key: str = "",
 ) -> str:
     result: dict[str, Any] | None = None
     levels = NINFER_VISION_LEVELS if image_urls else ((0, 0),)
@@ -681,7 +691,16 @@ def _api_chat(
             "stream": False,
         }
         try:
-            result = _json_request(api_base.rstrip("/") + "/chat/completions", payload, int(_settings()["request_timeout_seconds"]))
+            endpoint = api_base.strip().rstrip("/")
+            if not endpoint.lower().endswith("/chat/completions"):
+                endpoint += "/chat/completions"
+            auth_headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+            result = _json_request(
+                endpoint,
+                payload,
+                int(_settings()["request_timeout_seconds"]),
+                auth_headers,
+            )
             break
         except RuntimeError as exc:
             last_error = exc
@@ -1151,6 +1170,10 @@ class AIManziMultimodalPrompt:
             "required": {
                 # Keep the user prompt at the top of the node. All runtime/model knobs follow it.
                 "文字要求": ("STRING", {"multiline": True, "default": "根据输入内容生成可直接使用的正向提示词。"}),
+                "推理方式": (["本地推理", "在线推理"], {"default": "本地推理"}),
+                "在线_API_URL": ("STRING", {"default": "https://api.openai.com/v1"}),
+                "在线_API_Key": ("STRING", {"default": "", "password": True}),
+                "在线_模型_ID": ("STRING", {"default": ""}),
                 "启用_ninfer": ("BOOLEAN", {"default": True}),
                 "启用思考模式": ("BOOLEAN", {"default": True}),
                 "推理后卸载模型": ("BOOLEAN", {"default": False}),
@@ -1169,6 +1192,8 @@ class AIManziMultimodalPrompt:
         }
 
     def generate(self, **kwargs):
+        inference_mode = str(kwargs.get("推理方式", "本地推理"))
+        use_online = inference_mode == "在线推理"
         use_ninfer = bool(kwargs["启用_ninfer"])
         thinking = bool(kwargs.get("启用思考模式", True))
         unload_after = bool(kwargs.get("推理后卸载模型", False))
@@ -1187,7 +1212,7 @@ class AIManziMultimodalPrompt:
         # Apply that cap while converting the Comfy tensor, not after creating
         # a full-resolution PNG/data URL. GGUF also gets a conservative 2MP
         # pre-cap before the later shared 6MP budget is enforced.
-        input_item_pixels = 1024 * 1024 if use_ninfer else 2 * 1024 * 1024
+        input_item_pixels = 1024 * 1024 if (use_ninfer or use_online) else 2 * 1024 * 1024
         for key in sorted(
             (item for item in kwargs if re.fullmatch(r"图像_\d+", item) and int(item.split("_")[-1]) <= MAX_DYNAMIC_IMAGE_INPUTS),
             key=lambda item: int(item.split("_")[-1]),
@@ -1205,45 +1230,70 @@ class AIManziMultimodalPrompt:
         video = kwargs.get("视频输入")
         if video is not None:
             image_urls.extend(_video_frame_urls(video))
-        model, mmproj = _validate_model(str(kwargs["模型"]), use_ninfer, bool(image_urls), str(kwargs["mmproj"]))
         backend_kind: str | None = None
         try:
-            if use_ninfer:
-                backend_kind = "ninfer"
-                # Direct vision in some ternary NInfer artifacts is structurally present but
-                # semantically misaligned with the converted language body. Ground the media
-                # with a local Qwen vision GGUF, then let NInfer do the final writing pass.
-                if image_urls:
-                    visual_facts = _ninfer_visual_facts(instruction, image_urls)
-                    instruction += (
-                        "\n\n以下内容由视觉桥接模型从本次输入图像/视频像素中提取，"
-                        "是生成结果时必须遵守的画面事实。不得声称未收到媒体，也不得用模板示例覆盖这些事实：\n"
-                        + visual_facts
-                    )
-                    image_urls = []
-                    # The bridge has finished and its result is plain text. Close its
-                    # llama.cpp instance before NInfer reserves host/device memory.
-                    _unload_plugin_model(None)
-                # ComfyUI intentionally keeps recently used diffusion/CLIP/VAE models
-                # resident. NInfer's 27B loader requires nearly all of a 16 GiB GPU,
-                # so release those managed allocations before starting the engine.
-                _release_comfy_vram_for_ninfer()
-                context_tokens = _auto_context_tokens(instruction, 0)
-                _ensure_server("ninfer", model, False, thinking=thinking, context_tokens=context_tokens)
-                api_base = _settings()["ninfer_api_base"]
+            if use_online:
+                api_base = str(kwargs.get("在线_API_URL", "")).strip()
+                api_key = str(kwargs.get("在线_API_Key", "")).strip()
+                model_id = str(kwargs.get("在线_模型_ID", "")).strip()
+                parsed_api = urlsplit(api_base)
+                if parsed_api.scheme not in {"http", "https"} or not parsed_api.netloc:
+                    raise ValueError("在线推理的 API URL 无效，请填写 http:// 或 https:// 开头的地址。")
+                if not model_id:
+                    raise ValueError("在线推理必须填写模型 ID。")
+                image_urls = _resize_media_to_budget(
+                    image_urls,
+                    VISION_SAFE_TOTAL_PIXELS,
+                    1024 * 1024,
+                )
                 answer = _api_chat(
                     api_base,
-                    _server_model_id(api_base, model.name),
+                    model_id,
                     instruction,
-                    [],
+                    image_urls,
                     allow_reasoning,
+                    api_key,
                 )
             else:
-                backend_kind = "llama_cpp"
-                image_urls = _resize_media_to_budget(image_urls, VISION_SAFE_TOTAL_PIXELS)
-                answer = _llamacpp_chat(
-                    model, instruction, image_urls, mmproj, thinking, allow_reasoning=allow_reasoning
+                model, mmproj = _validate_model(
+                    str(kwargs["模型"]), use_ninfer, bool(image_urls), str(kwargs["mmproj"])
                 )
+                if use_ninfer:
+                    backend_kind = "ninfer"
+                    # Direct vision in some ternary NInfer artifacts is structurally present but
+                    # semantically misaligned with the converted language body. Ground the media
+                    # with a local Qwen vision GGUF, then let NInfer do the final writing pass.
+                    if image_urls:
+                        visual_facts = _ninfer_visual_facts(instruction, image_urls)
+                        instruction += (
+                            "\n\n以下内容由视觉桥接模型从本次输入图像/视频像素中提取，"
+                            "是生成结果时必须遵守的画面事实。不得声称未收到媒体，也不得用模板示例覆盖这些事实：\n"
+                            + visual_facts
+                        )
+                        image_urls = []
+                        # The bridge has finished and its result is plain text. Close its
+                        # llama.cpp instance before NInfer reserves host/device memory.
+                        _unload_plugin_model(None)
+                    # ComfyUI intentionally keeps recently used diffusion/CLIP/VAE models
+                    # resident. NInfer's 27B loader requires nearly all of a 16 GiB GPU,
+                    # so release those managed allocations before starting the engine.
+                    _release_comfy_vram_for_ninfer()
+                    context_tokens = _auto_context_tokens(instruction, 0)
+                    _ensure_server("ninfer", model, False, thinking=thinking, context_tokens=context_tokens)
+                    api_base = _settings()["ninfer_api_base"]
+                    answer = _api_chat(
+                        api_base,
+                        _server_model_id(api_base, model.name),
+                        instruction,
+                        [],
+                        allow_reasoning,
+                    )
+                else:
+                    backend_kind = "llama_cpp"
+                    image_urls = _resize_media_to_budget(image_urls, VISION_SAFE_TOTAL_PIXELS)
+                    answer = _llamacpp_chat(
+                        model, instruction, image_urls, mmproj, thinking, allow_reasoning=allow_reasoning
+                    )
         finally:
             if unload_after:
                 _unload_plugin_model(backend_kind)
