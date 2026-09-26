@@ -2,4 +2,4 @@ __pycache__/
 *.py[cod]
 engine/*-startup.log
 *.log
-
+tools/ffmpeg/
