@@ -1,66 +1,57 @@
 # AI蛮子多模态提示词工作台 / AIManzi Multimodal Prompt Workbench
 
-[中文说明](#中文说明) · [English](#english)
+[中文新手教程](#中文新手教程) · [English Guide](#english-guide)
 
-## 下载 / Download
+把文字、图片或视频交给 AI，自动生成可以直接用于绘图、视频生成的提示词。既能使用电脑上的本地模型，也能连接 OpenAI 兼容的在线模型。
 
-- **插件源码 / Source:** [GitHub Repository](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt)
-- **完整插件包 / Full package:** [GitHub Releases](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest)
-- **AI蛮子 多模态工作台插件及模型 / Plugin and models:** [夸克网盘](https://pan.quark.cn/s/be99d9acf669)
+- [GitHub 完整插件包](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest)
+- [AI蛮子多模态工作台插件及模型（夸克网盘）](https://pan.quark.cn/s/be99d9acf669)
 
 ---
 
-# 中文说明
+# 中文新手教程
 
-## 插件作用
+## 这个插件可以做什么？
 
-AI蛮子多模态提示词工作台是一个面向 ComfyUI 的本地与在线大语言模型提示词节点。它可以读取文字、图片、视频帧以及 TXT、Markdown、Agent Skill 模板，通过本地 NInfer、本地 GGUF 或 OpenAI 兼容在线接口生成可直接交给图像/视频模型使用的正向提示词。
+即使你不会写提示词，也可以用这个插件完成：
 
-默认只从 `out` 输出最终提示词纯文本，不附加标题、解释、Markdown 或思考过程；只有用户在“文字要求”中明确要求 JSON、分镜、分析过程等其他格式时才改变输出。
+- 输入一句简单要求，让模型扩写成详细的绘图提示词。
+- 输入一张或多张图片，反推出画面中的人物、环境、光线、构图和风格。
+- 输入视频，自动抽取代表画面并生成视频内容提示词。
+- 加载 TXT、Markdown、`.skill` 或 Skill ZIP，让模型按照你的模板生成内容。
+- 在“本地推理”和“在线推理”之间切换。
+- 默认只从 `out` 输出最终提示词，不输出思考过程和多余说明。用户明确要求其他格式时除外。
 
-主要能力：
+## 效果截图
 
-- 本地 NInfer 推理：内置 RTX 40 系（SM89）和 RTX 50 系（SM120）引擎。
-- 通用 GGUF 推理：通过 ComfyUI Python 中的 `llama-cpp-python` 运行文本或视觉 GGUF。
-- 在线推理：兼容 OpenAI `chat/completions` 格式的 API URL、API Key 和模型 ID。
-- 多图输入：图像端口按连接顺序自动增加，最多 10 个端口；IMAGE 批次会逐张处理。
-- 视频输入：从整段视频中均匀抽取最多 10 张代表帧，不修改源视频。
-- 自动缩放：图片和视频帧在推理前保持比例压缩，避免超过视觉 patch 和媒体预算。
-- 模板与 Skill：读取 `.txt`、`.md`、`.markdown`、`.skill` 以及包含 `SKILL.md` 的 `.zip`。
-- Skill 安全解析：读取 `SKILL.md` 和 `references/` 文本，不执行 `scripts/`，不注入二进制 `assets/`，并拦截路径穿越、符号链接、加密包和异常压缩包。
-- 自动上下文：根据文字、模板和媒体数量自动选择上下文；本地上限跟随运行时，最高 262144 tokens。
-- 隐私输出：API Key 使用密码控件显示，模板、Skill 和完整 prompt 不输出到 ComfyUI 日志。
+### 本地模型
 
-## 工作流截图
+![本地推理工作流](assets/workflow-local.png)
 
-### 本地推理
+### 在线模型
 
-![AI蛮子多模态提示词工作台本地推理](assets/workflow-local.png)
+![在线推理工作流](assets/workflow-online.png)
 
-### 在线推理
+## 第一步：安装插件
 
-![AI蛮子多模态提示词工作台在线推理](assets/workflow-online.png)
+### 方法 A：下载压缩包（最适合新手）
 
-## 节点
+1. 打开 [GitHub Releases](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest)。
+2. 下载名为 `ComfyUI-AIManzi-MultimodalPrompt-版本号.zip` 的完整插件包。
+3. 解压后确认文件夹名称为 `ComfyUI-AIManzi-MultimodalPrompt`。
+4. 把整个文件夹复制到：
 
-### AI蛮子 加载模板 / Skill
+```text
+你的ComfyUI目录\custom_nodes\ComfyUI-AIManzi-MultimodalPrompt
+```
 
-上传 TXT、Markdown、`.skill` 或 Skill ZIP，解析后从“模板输入”端口连接到工作台。现有旧工作流中的 `TXT/MD 文件` 字段仍然兼容。
+5. 完全关闭 ComfyUI，然后重新启动。
 
-### AI蛮子 多模态提示词工作台
+> 不要把插件解压成两层同名文件夹。例如 `custom_nodes\插件名\插件名\nodes.py` 是错误的；正确位置应是 `custom_nodes\插件名\nodes.py`。
 
-- `文字要求`：描述需要模型完成的任务。
-- `推理方式`：选择“本地推理”或“在线推理”。
-- `模板输入`：连接模板/Skill 加载节点。
-- `图像_1 ... 图像_10`：连接图像后自动增加下一个图像端口。
-- `视频输入`：连接标准 ComfyUI `VIDEO` 输出。
-- `out`：最终纯文本提示词。
+### 方法 B：使用命令安装
 
-## 命令安装插件
-
-### 方法一：Git + Git LFS
-
-插件包含大体积 NInfer 引擎，克隆前必须安装 [Git LFS](https://git-lfs.com/)。在 PowerShell 中执行：
+本仓库包含大文件，因此电脑需要先安装 [Git](https://git-scm.com/download/win) 和 [Git LFS](https://git-lfs.com/)。在 PowerShell 中运行：
 
 ```powershell
 Set-Location "你的ComfyUI目录\custom_nodes"
@@ -70,7 +61,7 @@ Set-Location .\ComfyUI-AIManzi-MultimodalPrompt
 git lfs pull
 ```
 
-更新插件：
+以后更新插件：
 
 ```powershell
 Set-Location "你的ComfyUI目录\custom_nodes\ComfyUI-AIManzi-MultimodalPrompt"
@@ -78,33 +69,41 @@ git pull
 git lfs pull
 ```
 
-### 方法二：完整压缩包
+更新后重新启动 ComfyUI。
 
-从 [GitHub Releases](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest) 下载 `ComfyUI-AIManzi-MultimodalPrompt-*.zip`，解压到：
+## 第二步：安装视频依赖 FFmpeg
 
-```text
-ComfyUI/custom_nodes/ComfyUI-AIManzi-MultimodalPrompt
-```
+只使用文字或图片时可以跳过本节。使用“视频输入”时必须安装 FFmpeg 和 FFprobe。
 
-安装或更新后必须完整重启 ComfyUI。
+### 方法 A：插件一键安装（推荐）
 
-## 视频依赖一键安装与配置
-
-视频输入依赖 FFmpeg 和 FFprobe。插件提供 Windows 一键脚本，会下载 FFmpeg Essentials 到插件的 `tools/ffmpeg`，自动把 `ffmpeg.exe` 的绝对路径写入 `config/settings.json`，不会修改系统 PATH。
-
-在插件目录运行：
+打开插件文件夹，在文件夹空白处按住 `Shift` 并点击鼠标右键，选择“在此处打开 PowerShell”，然后运行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
 ```
 
-也可以从任意目录执行完整命令：
+也可以直接使用完整路径：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "你的ComfyUI目录\custom_nodes\ComfyUI-AIManzi-MultimodalPrompt\install_video_dependency.ps1"
 ```
 
-脚本完成后重启 ComfyUI。若已经自行安装 FFmpeg，也可以直接编辑 `config/settings.json`：
+脚本会自动完成以下工作：
+
+1. 下载 Windows FFmpeg Essentials。
+2. 安装到插件内部的 `tools\ffmpeg\bin`。
+3. 检查 `ffmpeg.exe` 和 `ffprobe.exe` 是否完整。
+4. 自动把 FFmpeg 路径写入 `config\settings.json`。
+
+看到绿色的 `FFmpeg installed and configured` 后，重启 ComfyUI 即可。脚本不会修改系统 PATH。
+
+### 方法 B：手动安装
+
+1. 从 [FFmpeg 官网下载页](https://ffmpeg.org/download.html) 获取 Windows 版本并解压。
+2. 找到解压目录中的 `bin\ffmpeg.exe` 和 `bin\ffprobe.exe`。
+3. 打开插件的 `config\settings.json`。
+4. 把 `ffmpeg` 改为实际路径，Windows 路径推荐使用 `/`：
 
 ```json
 {
@@ -112,119 +111,185 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "你的ComfyUI目录\custom_
 }
 ```
 
-## 模型放置
+5. 保存文件并重启 ComfyUI。
 
-模型默认扫描：
+## 第三步：准备本地模型
+
+如果只使用在线推理，可以跳过本节。
+
+把模型文件放入：
 
 ```text
-ComfyUI/models/LLM
+你的ComfyUI目录\models\LLM
 ```
 
-支持：
+支持的模型：
 
-- `.ninfer`：仅在“启用 NInfer”时使用。
-- `.gguf`：关闭 NInfer 后使用。
-- 视觉 GGUF：主模型与匹配的 `mmproj*.gguf` 放在同一目录。
+- `.ninfer`：仅在开启“启用 NInfer”时使用，适合支持的 RTX 40/50 系显卡。
+- `.gguf`：关闭 NInfer 后使用，兼容范围更广。
+- 视觉 GGUF：要识别图片或视频，主模型和匹配的 `mmproj*.gguf` 必须放在同一文件夹。
 
-不支持直接加载 `.safetensors` 文本编码器或扩散模型文件。
+本节点不支持直接加载 `.safetensors` 扩散模型或文本编码器。
 
-普通 GGUF 后端需要 ComfyUI Python 中安装 `llama-cpp-python`。请使用你的 ComfyUI Python 执行：
+GGUF 推理还需要在 ComfyUI 自带的 Python 中安装 `llama-cpp-python`。便携版 ComfyUI 示例：
 
 ```powershell
-& "你的ComfyUI Python路径\python.exe" -m pip install -U llama-cpp-python
+Set-Location "你的ComfyUI目录"
+& ".\python_embeded\python.exe" -m pip install -U llama-cpp-python
 ```
 
-## 本地推理
+如果你的 Python 目录名称不同，请把路径替换成实际的 `python.exe`。
 
-### NInfer
+## 第四步：在 ComfyUI 中找到节点
 
-- RTX 40 系自动使用插件内置 `engine/ninfer-sm89`。
-- RTX 50 系自动使用插件内置 `engine/ninfer-sm120`。
-- 30 系、20 系、AMD、Intel 和纯 CPU 设备应关闭 NInfer，使用 GGUF 或在线推理。
-- NInfer 只使用插件内置引擎，不扫描电脑上的其他 NInfer 可执行文件。
-- 连接图像或视频时，插件自动使用本机 Qwen3-VL/Qwen3.5 视觉 GGUF 与 mmproj 提取客观视觉事实，再交给 NInfer 生成最终提示词，避免三元转换模型视觉语义错位。
-- 27B NInfer 可能需要接近独占 16GB 显存。启动前插件会卸载 ComfyUI 驻留的扩散模型、CLIP 和 VAE 并清理 CUDA 缓存，后续节点会按需重新加载。
+启动 ComfyUI 后，在画布空白位置双击并搜索：
 
-### GGUF
+- `AI蛮子 多模态提示词工作台`
+- `AI蛮子 加载模板 / Skill`
 
-- 直接调用 ComfyUI 环境中的 `llama-cpp-python`，不启动外部 llama-server。
-- 当前插件配置采用通用 CPU 加载方式，NVIDIA、AMD、Intel 和纯 CPU 设备均可运行，但速度取决于 CPU 与内存。
-- 图像或视频需要 Qwen3-VL/Qwen3.5 视觉 GGUF 以及匹配的 mmproj。
-- 开启“推理后卸载模型”可在生成完成后释放模型内存。
+工作台主要选项：
 
-## 在线推理
+| 选项 | 小白解释 |
+|---|---|
+| 文字要求 | 告诉 AI 你想让它做什么 |
+| 推理方式 | 选择本地模型或在线 API |
+| 模板输入 | 连接“加载模板 / Skill”节点 |
+| 图像_1 ～ 图像_10 | 连接图片；连接一个后会自动出现下一个接口 |
+| 视频输入 | 连接其他节点输出的 VIDEO |
+| out | 最终生成的纯文字提示词 |
 
-选择“在线推理”后，所有本地模型、NInfer、mmproj、思考和卸载选项会自动隐藏，只显示：
+## 使用示例
 
-- `在线_API_URL`：例如 `https://api.openai.com/v1`，也可填写完整的 `.../chat/completions`。
-- `在线_API_Key`：以密码形式显示；无鉴权服务可以留空。
-- `在线_模型_ID`：填写服务商实际提供的模型名称。
+### 示例 1：只有文字，生成绘图提示词
 
-在线模式不会加载本地 LLM，也不会占用本地 LLM 推理显存。文字、模板、Skill、图像和视频输入保持有效。服务商必须支持 OpenAI 兼容聊天接口；要发送图片或视频帧，所选在线模型还必须支持视觉输入。
+连接方式：
 
-> 安全提示：API Key 不会写入日志，但 ComfyUI 工作流可能保存控件值。公开分享工作流前请清空 Key。
+```text
+AI蛮子 多模态提示词工作台.out → Show Text
+```
 
-## 输出与限制
+“文字要求”填写：
 
-- 默认移除 `<think>`、`<analysis>`、reasoning 区块以及最终答案之前的分析文本。
-- “启用思考模式”允许本地模型内部推理，不代表把思考过程输出到 `out`。
-- 插件不设置固定的 1024-token 输出上限；实际输出仍受所选模型、服务商和上下文窗口限制。
-- 输入文字、Skill、图像视觉 tokens 和输出共享模型上下文。
-- 在线服务的计费、内容限制、媒体大小和上下文长度由服务商决定。
+```text
+生成一段东方幻想天宫场景的绘图提示词，包含云海、宫殿、金色晨光和电影级构图。
+```
+
+没有连接图片时，插件会按照文字要求直接生成提示词。
+
+### 示例 2：图片反推提示词
+
+连接方式：
+
+```text
+加载图像.图像 → 工作台.图像_1
+工作台.out → Show Text
+```
+
+“文字要求”填写：
+
+```text
+观察图片实际内容，反推出可复现该画面的详细正向提示词。
+```
+
+可以继续连接更多图片，最多显示 10 个图像接口。图片会在发送前保持比例自动缩放，不会修改原文件。
+
+### 示例 3：视频反推提示词
+
+连接方式：
+
+```text
+视频加载节点.VIDEO → 工作台.视频输入
+工作台.out → Show Text
+```
+
+“文字要求”填写：
+
+```text
+根据视频中的主体、动作、镜头、环境和光线，只输出一段视频生成提示词。
+```
+
+插件会从整段视频中均匀抽取最多 10 张代表帧。若提示“未找到 FFmpeg”，请返回上面的 FFmpeg 安装章节。
+
+### 示例 4：使用模板或 Skill
+
+连接方式：
+
+```text
+AI蛮子 加载模板 / Skill.模板输入 → 工作台.模板输入
+工作台.out → Show Text
+```
+
+点击“上传模板 / Skill”，可以上传 `.txt`、`.md`、`.markdown`、`.skill` 或包含 `SKILL.md` 的 ZIP。插件只读取模板文字，不会执行 Skill 中的脚本。
+
+### 示例 5：在线推理
+
+把“推理方式”切换为“在线推理”，然后填写：
+
+```text
+在线_API_URL：https://服务商地址/v1
+在线_API_Key：服务商提供的密钥
+在线_模型_ID：服务商提供的模型名称
+```
+
+在线模式不加载本地 LLM。若需要识别图片或视频，在线模型本身必须支持视觉输入。
+
+> API Key 虽然不会打印到日志，但可能保存在 ComfyUI 工作流文件中。分享工作流前请清空 Key。
+
+## 本地模式应该怎么选？
+
+- RTX 40/50 系并且拥有 `.ninfer` 模型：可以打开 NInfer。
+- RTX 30/20 系、AMD、Intel 或纯 CPU：关闭 NInfer，使用 GGUF，或者选择在线推理。
+- 需要图片/视频识别：必须使用视觉模型。普通纯文本模型看不懂图片。
+- NInfer 识别图片/视频时：插件会先用本地视觉 GGUF + mmproj 读取画面，再交给 NInfer 整理最终提示词。
+
+## 常见问题
+
+### 节点没有出现
+
+检查是否出现了双层插件目录，然后查看 ComfyUI 启动窗口有没有红色报错。修正后必须完整重启 ComfyUI。
+
+### 模型列表是空的
+
+确认模型位于 `ComfyUI\models\LLM`，扩展名是 `.gguf` 或 `.ninfer`，然后重启 ComfyUI。
+
+### 图片接入后仍提示上传图片
+
+必须把“加载图像”节点的 `图像` 输出连接到工作台的 `图像_1`，不是只在文字中填写图片路径。所选模型也必须支持视觉。
+
+### 视频报“未找到 FFmpeg”
+
+运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
+```
+
+完成后重启 ComfyUI。仍失败时检查 `config\settings.json` 中的路径是否指向真实存在的 `ffmpeg.exe`。
+
+### NInfer 启动时显存不足
+
+27B 模型可能需要接近独占 16GB 显存。关闭其他占用显存的软件后重试；仍然无法加载时，关闭 NInfer 并改用 GGUF 或在线推理。降低上下文不能解决模型权重本身装不进显存的问题。
+
+### 为什么输出长度不是无限的？
+
+插件没有固定的 1024-token 输出限制，但最终长度仍受模型上下文、电脑内存/显存和在线服务商限制。输入文字、模板、图片视觉 tokens 与输出共同占用上下文。
 
 ---
 
-# English
+# English Guide
 
-## What this plugin does
+## What does this plugin do?
 
-AIManzi Multimodal Prompt Workbench is a ComfyUI extension for generating production-ready image and video prompts with local or hosted large language models. It accepts text instructions, images, sampled video frames, TXT/Markdown templates, and packaged Agent Skills, then sends them to local NInfer, local GGUF, or an OpenAI-compatible online endpoint.
+AIManzi Multimodal Prompt Workbench turns text, images, videos, and reusable templates into prompts for image or video generation. It supports local NInfer, local GGUF, and OpenAI-compatible online APIs. By default, `out` returns only the final prompt as plain text.
 
-By default, the single `out` socket returns only the final positive prompt as plain text. Titles, explanations, Markdown, and reasoning are removed unless the user explicitly requests another format or asks to see the analysis.
+## Beginner installation
 
-Key features:
+1. Download the complete ZIP from [GitHub Releases](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest).
+2. Extract it to `ComfyUI/custom_nodes/ComfyUI-AIManzi-MultimodalPrompt`.
+3. Make sure `nodes.py` is directly inside that folder, not inside a second nested folder.
+4. Restart ComfyUI.
 
-- Bundled NInfer engines for NVIDIA RTX 40-series (SM89) and RTX 50-series (SM120).
-- Universal local GGUF backend powered by `llama-cpp-python`.
-- OpenAI-compatible online inference with API URL, API Key, and model ID.
-- Up to 10 dynamically revealed IMAGE sockets, including batched IMAGE inputs.
-- VIDEO input with up to 10 representative frames sampled across the full clip.
-- Automatic aspect-ratio-preserving image and video-frame resizing.
-- TXT, Markdown, `.skill`, and Skill ZIP parsing.
-- Safe Skill handling: reads `SKILL.md` and text references without executing scripts or loading binary assets.
-- Automatic local context sizing up to 262144 tokens when supported by the runtime.
-- Clean final-prompt output with hidden reasoning and no full prompt/template logging.
-
-## Workflow screenshots
-
-### Local inference
-
-![AIManzi local inference workflow](assets/workflow-local.png)
-
-### Online inference
-
-![AIManzi online inference workflow](assets/workflow-online.png)
-
-## Nodes
-
-### AIManzi Load Template / Skill
-
-Uploads TXT, Markdown, `.skill`, or a ZIP containing one `SKILL.md`, then exposes the parsed content through the template output.
-
-### AIManzi Multimodal Prompt Workbench
-
-- `文字要求`: task/instruction text.
-- `推理方式`: local or online inference.
-- `模板输入`: parsed template or Skill input.
-- `图像_1 ... 图像_10`: dynamic image inputs.
-- `视频输入`: standard ComfyUI VIDEO input.
-- `out`: final prompt text.
-
-## Command-line installation
-
-### Git + Git LFS
-
-The repository contains large NInfer binaries, so [Git LFS](https://git-lfs.com/) is required:
+Command-line installation requires Git and Git LFS:
 
 ```powershell
 Set-Location "path-to-ComfyUI\custom_nodes"
@@ -234,65 +299,56 @@ Set-Location .\ComfyUI-AIManzi-MultimodalPrompt
 git lfs pull
 ```
 
-To update:
+## Install FFmpeg for video input
 
-```powershell
-Set-Location "path-to-ComfyUI\custom_nodes\ComfyUI-AIManzi-MultimodalPrompt"
-git pull
-git lfs pull
-```
-
-Alternatively, download the complete ZIP from [GitHub Releases](https://github.com/xumanzi/ComfyUI-AIManzi-MultimodalPrompt/releases/latest), extract it into `ComfyUI/custom_nodes`, and restart ComfyUI.
-
-## One-command video dependency setup
-
-VIDEO input requires FFmpeg and FFprobe. On Windows, run the bundled installer from the plugin directory:
+Text and image input do not require FFmpeg. VIDEO input requires both FFmpeg and FFprobe. Open PowerShell in the plugin folder and run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
 ```
 
-The script downloads FFmpeg Essentials into `tools/ffmpeg`, verifies both executables, and writes the absolute FFmpeg path to `config/settings.json`. It does not modify the system PATH. Restart ComfyUI afterward.
+The installer downloads FFmpeg into `tools/ffmpeg/bin`, verifies FFmpeg and FFprobe, and writes the correct path into `config/settings.json`. Restart ComfyUI afterward.
 
-## Models
+For manual setup, install FFmpeg and set:
 
-Place local models under:
-
-```text
-ComfyUI/models/LLM
+```json
+{
+  "ffmpeg": "D:/ffmpeg/bin/ffmpeg.exe"
+}
 ```
 
-- `.ninfer`: available when NInfer is enabled.
-- `.gguf`: available when NInfer is disabled.
-- Vision GGUF: keep the matching `mmproj*.gguf` beside the main model.
-- `.safetensors` diffusion models and text encoders are not supported by this LLM node.
+## Local models
 
-For GGUF inference, install `llama-cpp-python` into the Python environment used by ComfyUI:
+Place `.ninfer` and `.gguf` files in `ComfyUI/models/LLM`. A vision GGUF requires its matching `mmproj*.gguf` in the same directory. `.safetensors` diffusion models and text encoders are not supported.
+
+Portable ComfyUI GGUF dependency example:
 
 ```powershell
-& "path-to-ComfyUI-Python\python.exe" -m pip install -U llama-cpp-python
+Set-Location "path-to-ComfyUI"
+& ".\python_embeded\python.exe" -m pip install -U llama-cpp-python
 ```
 
-## Local inference behavior
+## Examples
 
-NInfer is limited to supported RTX 40/50-series GPUs. Other NVIDIA GPUs, AMD, Intel, and CPU-only systems should use GGUF or online inference. For NInfer media requests, a local Qwen3-VL/Qwen3.5 GGUF plus matching mmproj is used as a visual grounding bridge before NInfer writes the final prompt.
+### Text to prompt
 
-The GGUF backend runs inside ComfyUI through `llama-cpp-python` and currently uses a portable CPU configuration. Performance depends on CPU and system RAM.
+Enter: `Create a cinematic Eastern fantasy palace prompt with clouds and golden morning light.` Connect `out` to a text display node.
 
-## Online inference behavior
+### Image to prompt
 
-Selecting online inference hides every local-only control and shows:
+Connect `Load Image → 图像_1`, then enter: `Describe the visible image as a detailed positive generation prompt.` Up to 10 image inputs can be revealed dynamically.
 
-- `在线_API_URL`: an OpenAI-compatible base URL such as `https://api.openai.com/v1`, or a complete `.../chat/completions` URL.
-- `在线_API_Key`: masked in the node; may be empty for services without authentication.
-- `在线_模型_ID`: the provider's actual model ID.
+### Video to prompt
 
-Online mode does not load a local LLM. Text, templates, Skills, images, and video frames remain available. The selected hosted model must support vision to accept images or video frames.
+Connect a standard `VIDEO` output to `视频输入`, then enter: `Describe the subjects, motion, camera, environment, and lighting as one video prompt.` The plugin samples up to 10 representative frames.
 
-> Security: the key is not printed to logs, but ComfyUI workflows may serialize widget values. Clear the key before sharing a workflow publicly.
+### Online inference
 
-## Output and limits
+Choose online inference and enter the provider's API URL, API key, and model ID. The hosted model must support vision if images or videos are connected. Clear the API key before sharing a workflow because widget values may be serialized.
 
-- Reasoning blocks such as `<think>`, `<analysis>`, and common final-answer wrappers are removed by default.
-- There is no plugin-enforced 1024-token output cap.
-- Actual context, output length, media limits, pricing, and moderation rules depend on the selected model or API provider.
+## Hardware notes
+
+- NInfer is for supported RTX 40/50-series GPUs.
+- RTX 30/20-series, AMD, Intel, and CPU-only systems should use GGUF or online inference.
+- Local image/video understanding requires a compatible vision GGUF plus mmproj.
+- The plugin removes common reasoning blocks by default and does not impose a fixed 1024-token output cap; runtime and provider limits still apply.
