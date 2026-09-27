@@ -764,7 +764,7 @@ def _video_batch(images: Any) -> Any:
     else:
         array = np.asarray(images) if images is not None else None
     if array is None or array.ndim != 4 or array.shape[0] < 1 or array.shape[-1] not in (3, 4):
-        raise ValueError("视频帧输入必须连接加载视频节点输出的 IMAGE 批次，格式应为 [帧数, 高, 宽, RGB/RGBA]。")
+        raise ValueError("视频必须连接加载视频节点输出的 IMAGE 批次，格式应为 [帧数, 高, 宽, RGB/RGBA]。")
     return array
 
 
@@ -839,7 +839,7 @@ def _video_facts_from_frames(
 ) -> str:
     """Analyze chronological chunks, then return compact evidence for final synthesis."""
     if not frame_urls:
-        raise ValueError("视频帧输入为空。")
+        raise ValueError("视频 IMAGE 批次为空。")
     segment_count = int(np.ceil(len(frame_urls) / VIDEO_SEGMENT_FRAMES))
     facts: list[str] = []
     for offset in range(0, len(frame_urls), VIDEO_SEGMENT_FRAMES):
@@ -1207,7 +1207,7 @@ class AIManziMultimodalPrompt:
             "optional": _DynamicImageOptionalInputs({
                 "模板输入": ("AIMANZI_TEMPLATE",),
                 "图像_1": ("IMAGE",),
-                "视频帧输入": ("IMAGE",),
+                "视频": ("IMAGE",),
             }),
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1251,7 +1251,7 @@ class AIManziMultimodalPrompt:
         video_urls: list[str] = []
         video_indexes: list[int] = []
         video_total_frames = 0
-        video_frames = kwargs.get("视频帧输入")
+        video_frames = kwargs.get("视频")
         if video_frames is not None:
             video_urls, video_indexes, video_total_frames = _video_frame_urls(
                 video_frames,

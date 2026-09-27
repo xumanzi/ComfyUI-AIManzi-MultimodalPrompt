@@ -73,10 +73,10 @@ git lfs pull
 
 ## 第二步：准备视频帧
 
-工作台不再接收 `VIDEO` 文件对象，也不直接调用 FFmpeg。请使用 ComfyUI 的加载视频节点先把视频解码成 `IMAGE` 批次，再把它的图像输出连接到“视频帧输入”。如果加载视频节点本身提示缺少 FFmpeg，请按照该加载节点的说明安装依赖；本插件不需要单独配置 FFmpeg 路径。
+工作台不再接收 `VIDEO` 文件对象，也不直接调用 FFmpeg。请使用 ComfyUI 的加载视频节点先把视频解码成 `IMAGE` 批次，再把它的图像输出连接到“视频”。如果加载视频节点本身提示缺少 FFmpeg，请按照该加载节点的说明安装依赖；本插件不需要单独配置 FFmpeg 路径。
 
 ```text
-加载视频节点.图像/IMAGE → 工作台.视频帧输入
+加载视频节点.图像/IMAGE → 工作台.视频
 ```
 
 这样做可以直接使用加载节点输出的连续帧，并避免再次解码视频。
@@ -123,7 +123,7 @@ Set-Location "你的ComfyUI目录"
 | 推理方式 | 选择本地模型或在线 API |
 | 模板输入 | 连接“加载模板 / Skill”节点 |
 | 图像_1 ～ 图像_10 | 连接图片；连接一个后会自动出现下一个接口 |
-| 视频帧输入 | 连接加载视频节点输出的 IMAGE 批次 |
+| 视频 | 连接加载视频节点输出的 IMAGE 批次 |
 | 视频分析精度 | 快速16帧、标准64帧、高精度128帧、完整逐帧最多256帧 |
 | out | 最终生成的纯文字提示词 |
 
@@ -167,7 +167,7 @@ AI蛮子 多模态提示词工作台.out → Show Text
 连接方式：
 
 ```text
-视频加载节点.图像/IMAGE → 工作台.视频帧输入
+视频加载节点.图像/IMAGE → 工作台.视频
 工作台.out → Show Text
 ```
 
@@ -234,7 +234,7 @@ AI蛮子 加载模板 / Skill.模板输入 → 工作台.模板输入
 
 ### 视频报“未找到 FFmpeg”
 
-这个错误来自负责解码视频的加载视频节点，不是本工作台。请按照该加载节点的安装说明配置 FFmpeg；确认它能够正常输出 IMAGE 批次后，再连接到“视频帧输入”。
+这个错误来自负责解码视频的加载视频节点，不是本工作台。请按照该加载节点的安装说明配置 FFmpeg；确认它能够正常输出 IMAGE 批次后，再连接到“视频”。
 
 ### NInfer 启动时显存不足
 
@@ -271,7 +271,7 @@ git lfs pull
 
 ## Video frames
 
-The workbench no longer accepts a `VIDEO` object and does not invoke FFmpeg. Use a ComfyUI video loader to decode the video, then connect its batched `IMAGE` output to `视频帧输入`. If that loader requires FFmpeg, follow the loader's own installation instructions.
+The workbench no longer accepts a `VIDEO` object and does not invoke FFmpeg. Use a ComfyUI video loader to decode the video, then connect its batched `IMAGE` output to `视频`. If that loader requires FFmpeg, follow the loader's own installation instructions.
 
 ## Local models
 
@@ -296,7 +296,7 @@ Connect `Load Image → 图像_1`, then enter: `Describe the visible image as a 
 
 ### Video to prompt
 
-Connect the video loader's batched `IMAGE` output to `视频帧输入`, then enter: `Describe the subjects, motion, camera, environment, and lighting as one video prompt.` Frames remain chronological. Depending on the selected precision, the workbench uses up to 16, 64, 128, or 256 frames, combines uniform timeline coverage with scene-change frames, analyzes chunks of up to eight frames, and synthesizes one final prompt.
+Connect the video loader's batched `IMAGE` output to `视频`, then enter: `Describe the subjects, motion, camera, environment, and lighting as one video prompt.` Frames remain chronological. Depending on the selected precision, the workbench uses up to 16, 64, 128, or 256 frames, combines uniform timeline coverage with scene-change frames, analyzes chunks of up to eight frames, and synthesizes one final prompt.
 
 ### Online inference
 

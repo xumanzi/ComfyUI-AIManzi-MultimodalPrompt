@@ -91,8 +91,8 @@ function uploadTemplate(node) {
 function orderMediaInputs(node) {
     const images = node.inputs.filter((input) => /^图像_\d+$/.test(input.name))
         .sort((a, b) => Number(a.name.slice(3)) - Number(b.name.slice(3)));
-    const video = node.inputs.filter((input) => input.name === "视频帧输入");
-    const rest = node.inputs.filter((input) => !/^图像_\d+$/.test(input.name) && input.name !== "视频帧输入");
+    const video = node.inputs.filter((input) => input.name === "视频");
+    const rest = node.inputs.filter((input) => !/^图像_\d+$/.test(input.name) && input.name !== "视频");
     // Template stays first; independent images follow it; the IMAGE video batch stays last.
     node.inputs = [...rest, ...images, ...video];
 }
@@ -119,6 +119,12 @@ app.registerExtension({
             return;
         }
         if (node.comfyClass !== NODE) return;
+        // Migrate the v1.2 IMAGE socket name without breaking its connection.
+        const formerFrameInput = node.inputs?.find((input) => input.name === "视频帧输入");
+        if (formerFrameInput) {
+            formerFrameInput.name = "视频";
+            formerFrameInput.type = "IMAGE";
+        }
         // v1.2 removes the former VIDEO socket. Old workflows are migrated by
         // deleting that stale socket; users reconnect the loader's IMAGE batch.
         const legacyVideoIndex = node.inputs?.findIndex((input) => input.name === "视频输入") ?? -1;
