@@ -71,47 +71,15 @@ git lfs pull
 
 更新后重新启动 ComfyUI。
 
-## 第二步：安装视频依赖 FFmpeg
+## 第二步：准备视频帧
 
-只使用文字或图片时可以跳过本节。使用“视频输入”时必须安装 FFmpeg 和 FFprobe。
+工作台不再接收 `VIDEO` 文件对象，也不直接调用 FFmpeg。请使用 ComfyUI 的加载视频节点先把视频解码成 `IMAGE` 批次，再把它的图像输出连接到“视频帧输入”。如果加载视频节点本身提示缺少 FFmpeg，请按照该加载节点的说明安装依赖；本插件不需要单独配置 FFmpeg 路径。
 
-### 方法 A：插件一键安装（推荐）
-
-打开插件文件夹，在文件夹空白处按住 `Shift` 并点击鼠标右键，选择“在此处打开 PowerShell”，然后运行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
+```text
+加载视频节点.图像/IMAGE → 工作台.视频帧输入
 ```
 
-也可以直接使用完整路径：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "你的ComfyUI目录\custom_nodes\ComfyUI-AIManzi-MultimodalPrompt\install_video_dependency.ps1"
-```
-
-脚本会自动完成以下工作：
-
-1. 下载 Windows FFmpeg Essentials。
-2. 安装到插件内部的 `tools\ffmpeg\bin`。
-3. 检查 `ffmpeg.exe` 和 `ffprobe.exe` 是否完整。
-4. 自动把 FFmpeg 路径写入 `config\settings.json`。
-
-看到绿色的 `FFmpeg installed and configured` 后，重启 ComfyUI 即可。脚本不会修改系统 PATH。
-
-### 方法 B：手动安装
-
-1. 从 [FFmpeg 官网下载页](https://ffmpeg.org/download.html) 获取 Windows 版本并解压。
-2. 找到解压目录中的 `bin\ffmpeg.exe` 和 `bin\ffprobe.exe`。
-3. 打开插件的 `config\settings.json`。
-4. 把 `ffmpeg` 改为实际路径，Windows 路径推荐使用 `/`：
-
-```json
-{
-  "ffmpeg": "D:/ffmpeg/bin/ffmpeg.exe"
-}
-```
-
-5. 保存文件并重启 ComfyUI。
+这样做可以直接使用加载节点输出的连续帧，并避免再次解码视频。
 
 ## 第三步：准备本地模型
 
@@ -155,7 +123,8 @@ Set-Location "你的ComfyUI目录"
 | 推理方式 | 选择本地模型或在线 API |
 | 模板输入 | 连接“加载模板 / Skill”节点 |
 | 图像_1 ～ 图像_10 | 连接图片；连接一个后会自动出现下一个接口 |
-| 视频输入 | 连接其他节点输出的 VIDEO |
+| 视频帧输入 | 连接加载视频节点输出的 IMAGE 批次 |
+| 视频分析精度 | 快速16帧、标准64帧、高精度128帧、完整逐帧最多256帧 |
 | out | 最终生成的纯文字提示词 |
 
 ## 使用示例
@@ -198,7 +167,7 @@ AI蛮子 多模态提示词工作台.out → Show Text
 连接方式：
 
 ```text
-视频加载节点.VIDEO → 工作台.视频输入
+视频加载节点.图像/IMAGE → 工作台.视频帧输入
 工作台.out → Show Text
 ```
 
@@ -208,7 +177,14 @@ AI蛮子 多模态提示词工作台.out → Show Text
 根据视频中的主体、动作、镜头、环境和光线，只输出一段视频生成提示词。
 ```
 
-插件会从整段视频中均匀抽取最多 10 张代表帧。若提示“未找到 FFmpeg”，请返回上面的 FFmpeg 安装章节。
+插件按 IMAGE 批次的原始顺序读取视频。短视频会保留全部帧；长视频会同时选择覆盖完整时间线的均匀帧和画面变化明显的关键帧，再按每段最多8帧进行视觉分析，最后汇总动作、运镜、转场、场景和首尾变化。
+
+精度建议：
+
+- 快速：最多16帧，适合测试。
+- 标准：最多64帧，适合大多数视频。
+- 高精度：最多128帧，适合动作和转场较多的视频。
+- 完整逐帧：视频不超过256帧时逐帧分析；更长视频会智能选择最多256帧。耗时和在线费用最高。
 
 ### 示例 4：使用模板或 Skill
 
@@ -258,13 +234,7 @@ AI蛮子 加载模板 / Skill.模板输入 → 工作台.模板输入
 
 ### 视频报“未找到 FFmpeg”
 
-运行：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
-```
-
-完成后重启 ComfyUI。仍失败时检查 `config\settings.json` 中的路径是否指向真实存在的 `ffmpeg.exe`。
+这个错误来自负责解码视频的加载视频节点，不是本工作台。请按照该加载节点的安装说明配置 FFmpeg；确认它能够正常输出 IMAGE 批次后，再连接到“视频帧输入”。
 
 ### NInfer 启动时显存不足
 
@@ -299,23 +269,9 @@ Set-Location .\ComfyUI-AIManzi-MultimodalPrompt
 git lfs pull
 ```
 
-## Install FFmpeg for video input
+## Video frames
 
-Text and image input do not require FFmpeg. VIDEO input requires both FFmpeg and FFprobe. Open PowerShell in the plugin folder and run:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install_video_dependency.ps1
-```
-
-The installer downloads FFmpeg into `tools/ffmpeg/bin`, verifies FFmpeg and FFprobe, and writes the correct path into `config/settings.json`. Restart ComfyUI afterward.
-
-For manual setup, install FFmpeg and set:
-
-```json
-{
-  "ffmpeg": "D:/ffmpeg/bin/ffmpeg.exe"
-}
-```
+The workbench no longer accepts a `VIDEO` object and does not invoke FFmpeg. Use a ComfyUI video loader to decode the video, then connect its batched `IMAGE` output to `视频帧输入`. If that loader requires FFmpeg, follow the loader's own installation instructions.
 
 ## Local models
 
@@ -340,7 +296,7 @@ Connect `Load Image → 图像_1`, then enter: `Describe the visible image as a 
 
 ### Video to prompt
 
-Connect a standard `VIDEO` output to `视频输入`, then enter: `Describe the subjects, motion, camera, environment, and lighting as one video prompt.` The plugin samples up to 10 representative frames.
+Connect the video loader's batched `IMAGE` output to `视频帧输入`, then enter: `Describe the subjects, motion, camera, environment, and lighting as one video prompt.` Frames remain chronological. Depending on the selected precision, the workbench uses up to 16, 64, 128, or 256 frames, combines uniform timeline coverage with scene-change frames, analyzes chunks of up to eight frames, and synthesizes one final prompt.
 
 ### Online inference
 

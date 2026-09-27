@@ -12,9 +12,7 @@ import io
 import json
 import os
 import re
-import shutil
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -40,10 +38,16 @@ except ImportError:  # ComfyUI always provides torch; keeps module error readabl
 PLUGIN_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = PLUGIN_DIR / "config" / "settings.json"
 MODEL_EXTENSIONS = {".ninfer", ".gguf"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
 AUTO_CONTEXT_MIN = 4096
 AUTO_CONTEXT_MAX = 262144
 MAX_DYNAMIC_IMAGE_INPUTS = 10
+VIDEO_ANALYSIS_LIMITS = {
+    "快速（最多16帧）": 16,
+    "标准（最多64帧）": 64,
+    "高精度（最多128帧）": 128,
+    "完整逐帧（最多256帧）": 256,
+}
+VIDEO_SEGMENT_FRAMES = 8
 SKILL_MAX_FILES = 500
 SKILL_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 SKILL_MAX_TEXT_FILE_BYTES = 1024 * 1024
@@ -86,11 +90,15 @@ class _DynamicImageOptionalInputs(dict):
 
 
 def _settings() -> dict[str, Any]:
+    default_llm_root = (
+        Path(folder_paths.models_dir) / "LLM"
+        if folder_paths is not None and getattr(folder_paths, "models_dir", None)
+        else Path.cwd() / "models" / "LLM"
+    )
     defaults: dict[str, Any] = {
-        "llm_roots": [str(Path.cwd() / "models" / "LLM")],
+        "llm_roots": [str(default_llm_root)],
         "ninfer_api_base": "http://127.0.0.1:8080/v1",
         "llama_api_base": "http://127.0.0.1:8082/v1",
-        "ffmpeg": "ffmpeg",
         "request_timeout_seconds": 600,
         "llama_server_command": "",
     }
@@ -658,6 +666,7 @@ def _api_chat(
     image_urls: list[str],
     allow_reasoning: bool = False,
     api_key: str = "",
+    observation_mode: bool = False,
 ) -> str:
     result: dict[str, Any] | None = None
     levels = NINFER_VISION_LEVELS if image_urls else ((0, 0),)
@@ -675,9 +684,14 @@ def _api_chat(
                 {
                     "role": "system",
                     "content": (
-                        "你是提示词助手。默认只输出可直接使用的正向提示词纯文本，不添加解释、标题或 Markdown。"
-                        "可以在内部思考，但最终消息严禁包含分析、推理步骤、思考过程或总结；"
-                        "只有用户明确要求其他输出格式或展示分析时，才遵循用户的额外约束。"
+                        (
+                            "你是视频视觉观察助手。只按输入帧的先后顺序记录实际可见事实，"
+                            "特别关注连续动作、镜头运动、场景变化和首尾状态；不要生成最终提示词。"
+                            if observation_mode else
+                            "你是提示词助手。默认只输出可直接使用的正向提示词纯文本，不添加解释、标题或 Markdown。"
+                            "可以在内部思考，但最终消息严禁包含分析、推理步骤、思考过程或总结；"
+                            "只有用户明确要求其他输出格式或展示分析时，才遵循用户的额外约束。"
+                        )
                         + (
                             "本轮已附带图像或视频画面，必须以媒体中实际可见的像素内容为首要事实，"
                             "不得把模板中的示例描述当成画面内容，也绝不能要求用户再次上传媒体。"
@@ -743,106 +757,103 @@ def _tensor_data_url(tensor: Any, max_pixels: int | None = None) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(stream.getvalue()).decode("ascii")
 
 
-def _frames_from_tensor(images: Any, max_pixels: int = 1024 * 1024) -> list[str]:
+def _video_batch(images: Any) -> Any:
+    """Validate a decoded ComfyUI video-frame IMAGE batch without copying it."""
     if torch is not None and isinstance(images, torch.Tensor):
         array = images
     else:
         array = np.asarray(images) if images is not None else None
-    if array is not None and array.ndim == 4:
-        count = array.shape[0]
-        indexes = np.linspace(0, count - 1, min(10, count), dtype=int)
-        return [_tensor_data_url(array[index], max_pixels) for index in indexes]
-    return []
+    if array is None or array.ndim != 4 or array.shape[0] < 1 or array.shape[-1] not in (3, 4):
+        raise ValueError("视频帧输入必须连接加载视频节点输出的 IMAGE 批次，格式应为 [帧数, 高, 宽, RGB/RGBA]。")
+    return array
 
 
-def _video_frame_urls_from_file(video_path: str) -> list[str]:
-    path = Path(video_path)
-    if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
-        raise ValueError("视频必须是存在的 mp4/mov/webm/mkv/avi 文件路径。")
-    ffmpeg = _settings()["ffmpeg"]
-    if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file():
-        raise RuntimeError("未找到 FFmpeg。请安装 FFmpeg，或在 config/settings.json 的 ffmpeg 中填写 ffmpeg.exe 路径。")
+def _video_frame_signature(frame: Any) -> np.ndarray:
+    """Create a tiny luminance signature used only for scene-change ranking."""
+    if torch is not None and isinstance(frame, torch.Tensor):
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        sample = frame[::max(1, height // 32), ::max(1, width // 32), :3].detach().float().cpu().numpy()
+    else:
+        source = np.asarray(frame)
+        height, width = source.shape[:2]
+        sample = source[::max(1, height // 32), ::max(1, width // 32), :3].astype(np.float32, copy=False)
+    if sample.shape[0] > 32 or sample.shape[1] > 32:
+        sample = sample[:32, :32]
+    return sample.mean(axis=2)
 
-    # Sample across the entire clip, rather than taking only the first 30
-    # seconds.  ffprobe ships with normal FFmpeg distributions; a compatible
-    # fps fallback remains for minimal FFmpeg installations without it.
-    ffprobe_candidates = [str(Path(ffmpeg).with_name("ffprobe.exe"))] if Path(ffmpeg).is_file() else []
-    ffprobe_candidates.extend([item for item in (shutil.which("ffprobe"), shutil.which("ffprobe.exe")) if item])
-    duration: float | None = None
-    for ffprobe in dict.fromkeys(ffprobe_candidates):
-        if not Path(ffprobe).is_file() and not shutil.which(ffprobe):
-            continue
-        try:
-            probe = subprocess.run(
-                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            value = float(probe.stdout.strip())
-            if probe.returncode == 0 and np.isfinite(value) and value > 0:
-                duration = value
+
+def _select_video_frame_indexes(images: Any, precision: str) -> list[int]:
+    """Blend timeline coverage with visual-change frames while preserving order."""
+    batch = _video_batch(images)
+    count = int(batch.shape[0])
+    limit = min(count, VIDEO_ANALYSIS_LIMITS.get(precision, 64))
+    if count <= limit:
+        return list(range(count))
+
+    # Roughly two thirds of the budget guarantees full timeline coverage. The
+    # rest is spent on cuts/action changes that uniform sampling can miss.
+    uniform_count = max(2, int(round(limit * 0.65)))
+    selected = set(np.linspace(0, count - 1, uniform_count, dtype=int).tolist())
+    change_slots = max(0, limit - len(selected))
+    if change_slots:
+        scores: list[tuple[float, int]] = []
+        previous = _video_frame_signature(batch[0])
+        for index in range(1, count):
+            current = _video_frame_signature(batch[index])
+            common_h = min(previous.shape[0], current.shape[0])
+            common_w = min(previous.shape[1], current.shape[1])
+            score = float(np.mean(np.abs(current[:common_h, :common_w] - previous[:common_h, :common_w])))
+            scores.append((score, index))
+            previous = current
+        for _, index in sorted(scores, reverse=True):
+            selected.add(index)
+            if len(selected) >= limit:
                 break
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            continue
-    with tempfile.TemporaryDirectory(prefix="aimanzi_video_") as directory:
-        urls: list[str] = []
-        if duration is not None:
-            # One frame per three seconds for short clips, capped at ten evenly
-            # spread frames for long clips.  No keyframe-count widget is needed.
-            count = min(MAX_DYNAMIC_IMAGE_INPUTS, max(1, int(np.ceil(duration / 3))))
-            for index in range(count):
-                frame = Path(directory) / f"frame_{index:02d}.jpg"
-                timestamp = duration * index / count
-                command = [
-                    ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{timestamp:.3f}", "-i", str(path),
-                    "-frames:v", "1", "-vf", "scale='min(1024,iw)':-2", "-q:v", "3", "-y", str(frame),
-                ]
-                process = subprocess.run(command, capture_output=True, text=True, timeout=45)
-                if process.returncode == 0 and frame.is_file() and frame.stat().st_size > 0:
-                    urls.append("data:image/jpeg;base64," + base64.b64encode(frame.read_bytes()).decode("ascii"))
-        else:
-            out_pattern = str(Path(directory) / "frame_%02d.jpg")
-            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-vf", "fps=1/3,scale='min(1024,iw)':-2", "-frames:v", str(MAX_DYNAMIC_IMAGE_INPUTS), "-q:v", "3", out_pattern]
-            process = subprocess.run(command, capture_output=True, text=True, timeout=180)
-            if process.returncode != 0:
-                raise RuntimeError("FFmpeg 读取视频失败：" + process.stderr.strip())
-            for frame in sorted(Path(directory).glob("frame_*.jpg")):
-                urls.append("data:image/jpeg;base64," + base64.b64encode(frame.read_bytes()).decode("ascii"))
-        if not urls:
-            raise RuntimeError("未能从视频提取有效画面。")
-        return urls
+    selected.update((0, count - 1))
+    return sorted(selected)[:limit]
 
 
-def _video_frame_urls(video: Any) -> list[str]:
-    """Accept ComfyUI VIDEO objects from core/Easy-Media, not a manual path widget."""
-    if isinstance(video, str):  # Allows legacy saved workflows to fail gracefully or keep working.
-        return _video_frame_urls_from_file(video.strip().strip('"'))
-    try:
-        components = video.get_components()
-        frames = _frames_from_tensor(getattr(components, "images", None))
-        if frames:
-            return frames
-    except (AttributeError, NotImplementedError, RuntimeError, TypeError, ValueError):
-        pass
-    try:
-        source = video.get_stream_source()
-        if isinstance(source, (str, os.PathLike)) and Path(source).is_file():
-            return _video_frame_urls_from_file(str(source))
-    except (AttributeError, NotImplementedError, RuntimeError, TypeError, ValueError):
-        pass
-    temp_path = ""
-    try:
-        fd, temp_path = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd)
-        video.save_to(temp_path)
-        return _video_frame_urls_from_file(temp_path)
-    except Exception as exc:
-        raise RuntimeError("无法读取 VIDEO 输入。请使用标准 VIDEO 输出节点或 ComfyUI-Easy-Media 的视频加载节点。") from exc
-    finally:
-        if temp_path:
-            try:
-                Path(temp_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+def _video_frame_urls(images: Any, precision: str, max_pixels: int = 768 * 768) -> tuple[list[str], list[int], int]:
+    batch = _video_batch(images)
+    indexes = _select_video_frame_indexes(batch, precision)
+    urls = [_tensor_data_url(batch[index], max_pixels) for index in indexes]
+    return urls, indexes, int(batch.shape[0])
+
+
+def _video_segment_instruction(
+    user_instruction: str, frame_indexes: list[int], total_frames: int, segment_number: int, segment_count: int,
+) -> str:
+    labels = "、".join(str(index + 1) for index in frame_indexes)
+    return (
+        f"这是按原始时间顺序排列的视频第 {segment_number}/{segment_count} 段，"
+        f"本段包含原视频第 {labels} 帧，原视频共 {total_frames} 帧。"
+        "请只记录画面中实际可见的事实，并结合相邻帧判断主体动作、物体运动、镜头运动、"
+        "景别、场景变化、光线、色彩、风格和可辨识文字。不要生成最终提示词，不要要求重新上传视频，"
+        "不要把用户要求中的示例当作画面事实。单帧无法证明的运动必须标记为不确定。\n\n"
+        "用户最终任务（仅用于确定观察重点）：\n" + user_instruction
+    )
+
+
+def _video_facts_from_frames(
+    frame_urls: list[str], frame_indexes: list[int], total_frames: int, user_instruction: str, analyze_segment: Any,
+) -> str:
+    """Analyze chronological chunks, then return compact evidence for final synthesis."""
+    if not frame_urls:
+        raise ValueError("视频帧输入为空。")
+    segment_count = int(np.ceil(len(frame_urls) / VIDEO_SEGMENT_FRAMES))
+    facts: list[str] = []
+    for offset in range(0, len(frame_urls), VIDEO_SEGMENT_FRAMES):
+        urls = frame_urls[offset:offset + VIDEO_SEGMENT_FRAMES]
+        indexes = frame_indexes[offset:offset + VIDEO_SEGMENT_FRAMES]
+        number = offset // VIDEO_SEGMENT_FRAMES + 1
+        observation = analyze_segment(
+            _video_segment_instruction(user_instruction, indexes, total_frames, number, segment_count),
+            urls,
+        )
+        if not str(observation).strip():
+            raise RuntimeError(f"视频第 {number}/{segment_count} 段没有返回有效识别结果。")
+        facts.append(f"[时间段 {number}/{segment_count}，原始帧 {indexes[0] + 1}-{indexes[-1] + 1}]\n{observation.strip()}")
+    return "\n\n".join(facts)
 
 
 def _find_mmproj(model_path: Path) -> Path | None:
@@ -893,7 +904,9 @@ def _ninfer_visual_facts(instruction: str, image_urls: list[str]) -> str:
         "未出现的对象，不要把下面的任务文字或模板示例当作画面内容。\n\n"
         "用户最终任务（仅用于确定观察重点）：\n" + instruction
     )
-    facts = _llamacpp_chat(bridge_model, observation_request, grounded_media, bridge_mmproj, False)
+    facts = _llamacpp_chat(
+        bridge_model, observation_request, grounded_media, bridge_mmproj, False, observation_mode=True
+    )
     if not facts.strip():
         raise RuntimeError("视觉桥接模型没有返回可用的图像/视频识别结果。")
     return facts
@@ -923,6 +936,7 @@ def _llamacpp_chat(
     thinking: bool,
     context_tokens: int | None = None,
     allow_reasoning: bool = False,
+    observation_mode: bool = False,
 ) -> str:
     """Universal GGUF backend using ComfyUI's bundled llama-cpp-python CPU runtime.
 
@@ -985,9 +999,14 @@ def _llamacpp_chat(
                 {
                     "role": "system",
                     "content": (
-                        "你是提示词助手。默认只输出可直接使用的正向提示词纯文本，不添加解释、标题或 Markdown。"
-                        "可以在内部思考，但最终消息严禁包含分析、推理步骤、思考过程或总结；"
-                        "只有用户明确要求其他输出格式或展示分析时，才遵循用户的额外约束。"
+                        (
+                            "你是视频视觉观察助手。只按输入帧的先后顺序记录实际可见事实，"
+                            "特别关注连续动作、镜头运动、场景变化和首尾状态；不要生成最终提示词。"
+                            if observation_mode else
+                            "你是提示词助手。默认只输出可直接使用的正向提示词纯文本，不添加解释、标题或 Markdown。"
+                            "可以在内部思考，但最终消息严禁包含分析、推理步骤、思考过程或总结；"
+                            "只有用户明确要求其他输出格式或展示分析时，才遵循用户的额外约束。"
+                        )
                         + (
                             "本轮已附带图像或视频画面，必须以媒体中实际可见的像素内容为首要事实，"
                             "不得把模板中的示例描述当成画面内容，也绝不能要求用户再次上传媒体。"
@@ -1017,7 +1036,8 @@ def _llamacpp_chat(
                 except Exception:
                     pass
                 return _llamacpp_chat(
-                    model_path, instruction, image_urls, mmproj, thinking, next_context, allow_reasoning
+                    model_path, instruction, image_urls, mmproj, thinking, next_context, allow_reasoning,
+                    observation_mode,
                 )
             raise RuntimeError(
                 f"GGUF 输入需要至少 {required_tokens} tokens，已达到模型/硬件自动上下文上限 "
@@ -1177,6 +1197,7 @@ class AIManziMultimodalPrompt:
                 "启用_ninfer": ("BOOLEAN", {"default": True}),
                 "启用思考模式": ("BOOLEAN", {"default": True}),
                 "推理后卸载模型": ("BOOLEAN", {"default": False}),
+                "视频分析精度": (list(VIDEO_ANALYSIS_LIMITS), {"default": "标准（最多64帧）"}),
                 "模型": (_model_choices(),),
                 "mmproj": (_mmproj_choices(),),
             },
@@ -1186,7 +1207,7 @@ class AIManziMultimodalPrompt:
             "optional": _DynamicImageOptionalInputs({
                 "模板输入": ("AIMANZI_TEMPLATE",),
                 "图像_1": ("IMAGE",),
-                "视频输入": ("VIDEO",),
+                "视频帧输入": ("IMAGE",),
             }),
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -1227,9 +1248,15 @@ class AIManziMultimodalPrompt:
                 image_urls.extend(_tensor_data_url(value[index], input_item_pixels) for index in range(value.shape[0]))
             else:
                 image_urls.append(_tensor_data_url(value, input_item_pixels))
-        video = kwargs.get("视频输入")
-        if video is not None:
-            image_urls.extend(_video_frame_urls(video))
+        video_urls: list[str] = []
+        video_indexes: list[int] = []
+        video_total_frames = 0
+        video_frames = kwargs.get("视频帧输入")
+        if video_frames is not None:
+            video_urls, video_indexes, video_total_frames = _video_frame_urls(
+                video_frames,
+                str(kwargs.get("视频分析精度", "标准（最多64帧）")),
+            )
         backend_kind: str | None = None
         try:
             if use_online:
@@ -1241,6 +1268,21 @@ class AIManziMultimodalPrompt:
                     raise ValueError("在线推理的 API URL 无效，请填写 http:// 或 https:// 开头的地址。")
                 if not model_id:
                     raise ValueError("在线推理必须填写模型 ID。")
+                if video_urls:
+                    video_facts = _video_facts_from_frames(
+                        video_urls,
+                        video_indexes,
+                        video_total_frames,
+                        instruction,
+                        lambda prompt, media: _api_chat(
+                            api_base, model_id, prompt, media, False, api_key, True
+                        ),
+                    )
+                    instruction += (
+                        "\n\n以下是视觉模型按原始时间顺序对视频各段的观察记录。"
+                        "请综合全部时间段，重点还原动作发展、镜头运动、转场和首尾变化；"
+                        "默认只输出最终视频提示词：\n" + video_facts
+                    )
                 image_urls = _resize_media_to_budget(
                     image_urls,
                     VISION_SAFE_TOTAL_PIXELS,
@@ -1256,13 +1298,34 @@ class AIManziMultimodalPrompt:
                 )
             else:
                 model, mmproj = _validate_model(
-                    str(kwargs["模型"]), use_ninfer, bool(image_urls), str(kwargs["mmproj"])
+                    str(kwargs["模型"]), use_ninfer, bool(image_urls or video_urls), str(kwargs["mmproj"])
                 )
                 if use_ninfer:
                     backend_kind = "ninfer"
                     # Direct vision in some ternary NInfer artifacts is structurally present but
                     # semantically misaligned with the converted language body. Ground the media
                     # with a local Qwen vision GGUF, then let NInfer do the final writing pass.
+                    if video_urls:
+                        bridge_model, bridge_mmproj = _find_visual_bridge_model()
+                        video_facts = _video_facts_from_frames(
+                            video_urls,
+                            video_indexes,
+                            video_total_frames,
+                            instruction,
+                            lambda prompt, media: _llamacpp_chat(
+                                bridge_model,
+                                prompt,
+                                _resize_media_to_budget(media, 4 * 1024 * 1024, 768 * 768),
+                                bridge_mmproj,
+                                False,
+                                observation_mode=True,
+                            ),
+                        )
+                        instruction += (
+                            "\n\n以下内容由视觉桥接模型按时间顺序分析本次视频帧得到，"
+                            "是必须遵守的视频事实。请综合动作发展、镜头运动、场景变化和首尾状态，"
+                            "默认只输出最终视频提示词：\n" + video_facts
+                        )
                     if image_urls:
                         visual_facts = _ninfer_visual_facts(instruction, image_urls)
                         instruction += (
@@ -1271,9 +1334,9 @@ class AIManziMultimodalPrompt:
                             + visual_facts
                         )
                         image_urls = []
-                        # The bridge has finished and its result is plain text. Close its
-                        # llama.cpp instance before NInfer reserves host/device memory.
-                        _unload_plugin_model(None)
+                    # Close any cached llama.cpp model before NInfer reserves
+                    # host/device memory. Media bridges have completed by here.
+                    _unload_plugin_model(None)
                     # ComfyUI intentionally keeps recently used diffusion/CLIP/VAE models
                     # resident. NInfer's 27B loader requires nearly all of a 16 GiB GPU,
                     # so release those managed allocations before starting the engine.
@@ -1290,6 +1353,26 @@ class AIManziMultimodalPrompt:
                     )
                 else:
                     backend_kind = "llama_cpp"
+                    if video_urls:
+                        video_facts = _video_facts_from_frames(
+                            video_urls,
+                            video_indexes,
+                            video_total_frames,
+                            instruction,
+                            lambda prompt, media: _llamacpp_chat(
+                                model,
+                                prompt,
+                                _resize_media_to_budget(media, 4 * 1024 * 1024, 768 * 768),
+                                mmproj,
+                                thinking,
+                                observation_mode=True,
+                            ),
+                        )
+                        instruction += (
+                            "\n\n以下是视觉模型按时间顺序对视频各段的观察记录。"
+                            "请综合全部时间段，重点还原动作发展、镜头运动、转场和首尾变化；"
+                            "默认只输出最终视频提示词：\n" + video_facts
+                        )
                     image_urls = _resize_media_to_budget(image_urls, VISION_SAFE_TOTAL_PIXELS)
                     answer = _llamacpp_chat(
                         model, instruction, image_urls, mmproj, thinking, allow_reasoning=allow_reasoning
