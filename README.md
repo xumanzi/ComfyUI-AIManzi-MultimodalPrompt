@@ -108,6 +108,21 @@ Set-Location "你的ComfyUI目录"
 
 如果你的 Python 目录名称不同，请把路径替换成实际的 `python.exe`。
 
+### GGUF 会自动使用 GPU 吗？
+
+会。插件会自动注册 llama.cpp 的 CUDA 动态后端，运行库查找顺序为：
+
+1. 插件自己的 `engine/llama-cuda-runtime`；
+2. ComfyUI Python 已安装的 NVIDIA CUDA 13 运行库；
+3. 本机 CUDA Toolkit；
+4. NVIDIA 官方显卡驱动的 DriverStore。
+
+不需要手动设置 `CUDA_PATH`，插件也不会修改 Windows 系统目录。检测到 CUDA 后会先释放
+ComfyUI 暂时驻留的扩散模型显存，再根据实际可用显存自动选择：全 GPU、GPU+CPU 混合、
+纯 CPU。显存不够时会尽可能把主模型层和视觉编码器保留在 GPU，CPU 只接管放不下的部分；
+只有 CUDA 不可用或连续加载失败时才完全回退 CPU。ComfyUI 日志会显示运行库来源、GPU 型号、
+GPU 层数、视觉编码器设备以及每次降级原因。
+
 ## 第四步：在 ComfyUI 中找到节点
 
 启动 ComfyUI 后，在画布空白位置双击并搜索：
@@ -120,12 +135,25 @@ Set-Location "你的ComfyUI目录"
 | 选项 | 小白解释 |
 |---|---|
 | 文字要求 | 告诉 AI 你想让它做什么 |
+| 推理策略 | 普通推理忠实执行；创新推理在不改变硬性要求和媒体事实的前提下主动丰富细节 |
+| 随机种子 | 控制结果的随机变化；相同模型、输入、设置和固定种子可以复现结果 |
+| 种子控制 | 随机、增加、减少、固定；任务入队前会计算实际种子，并立即回写到节点显示和推理请求 |
 | 推理方式 | 选择本地模型或在线 API |
 | 模板输入 | 连接“加载模板 / Skill”节点 |
 | 图像_1 ～ 图像_10 | 连接图片；连接一个后会自动出现下一个接口 |
 | 视频 | 连接加载视频节点输出的 IMAGE 批次 |
 | 视频分析精度 | 快速16帧、标准64帧、高精度128帧、完整逐帧最多256帧 |
 | out | 最终生成的纯文字提示词 |
+
+### 普通推理、创新推理和种子
+
+- 普通推理使用较低随机度，严格根据文字、模板和媒体事实生成，不主动添加未经要求的主体或情节。
+- 创新推理会合理增强构图、镜头、光线、色彩、材质、环境、氛围和艺术风格，但不会修改主体身份、
+  数量、指定文字或图片/视频中已经确认的事实。
+- “启用思考模式”控制模型内部推理深度；“推理策略”控制最终内容的创意强度，两者互不替代。
+- 图像和视频事实识别固定使用确定性种子，最终综合生成使用用户设置的主种子。
+- “随机”每次入队都会生成新的 32 位种子；“增加/减少”会在入队前更新一位；“固定”保持当前数值。ComfyUI 浏览器控制台和后端日志都会显示本轮实际种子，便于核对。
+- 在线服务不支持 `seed` 时，插件会自动移除该参数重试一次，并在日志中提示。
 
 ## 使用示例
 
@@ -195,7 +223,17 @@ AI蛮子 加载模板 / Skill.模板输入 → 工作台.模板输入
 工作台.out → Show Text
 ```
 
-点击“上传模板 / Skill”，可以上传 `.txt`、`.md`、`.markdown`、`.skill` 或包含 `SKILL.md` 的 ZIP。插件只读取模板文字，不会执行 Skill 中的脚本。
+点击“上传模板 / Skill”，可以上传 `.txt`、`.md`、`.markdown`、`.skill` 或包含 `SKILL.md` 的 ZIP。上传完成后，加载节点会立即解析文件，并把最终结果显示在“提交给模型的内容”文本框中。这个文本框可以直接编辑；其中显示的内容就是输出连接传递并提交给模型的唯一模板内容。
+
+TXT/MD 会保留完整正文；Skill 压缩包会按 `SKILL.md` 在前、`references` 文本资料在后的顺序合并。插件不会执行 Skill 中的脚本，也不会读取图片或其他二进制资源。多模态工作台不会再次打开文件、筛选章节、压缩、摘要或添加隐藏引用。
+
+解析结果按文件修改时间和大小缓存；重新上传同名但内容已变化的文件会重新解析。模板会放在稳定前缀位置以便重复任务复用缓存，同时视觉观察阶段不会重复读取整份模板。控制台只显示文件名、最终字符数和短哈希，不会打印模板正文。
+
+本地视觉事实使用最多 64 条内存 LRU 缓存。缓存键包含媒体实际内容、视频帧顺序、模型及 mmproj 文件身份、观察要求和分析参数；更换任意一项都会重新识别，不会串图或串视频。视觉观察固定使用确定性种子，不受最终生成的随机种子影响，因此只切换随机、增加、减少或固定种子时仍可复用同一份客观画面事实。切回完全相同的输入时可跳过重复视觉识别。缓存不写入磁盘，关闭 ComfyUI 后自动释放；“推理后卸载模型”只释放模型和显存，不会清除这部分普通内存缓存。
+
+插件另保留最多 32 条完全相同请求的最终结果缓存，用于固定种子的精确复现。不同文字、模板、媒体、模型、mmproj、思考模式、推理策略、上下文或种子都会生成新键。GGUF 不再在每轮前清空 token 状态，llama.cpp 可以复用下一请求的最长共同 KV 前缀；完全相同的固定种子请求则直接返回缓存结果。在线第三方 API 不缓存最终结果，本地 NInfer API 才启用该功能。
+
+GGUF 已加载的较大上下文可以直接服务后续较小上下文请求。例如模型已按 32768 上下文加载，再执行 8192 或 16384 请求时不会重新加载权重；只有需要更大上下文、切换模型、切换 mmproj 或切换思考处理器时才重新规划。
 
 ### 示例 5：在线推理
 
@@ -239,6 +277,23 @@ AI蛮子 加载模板 / Skill.模板输入 → 工作台.模板输入
 ### NInfer 启动时显存不足
 
 27B 模型可能需要接近独占 16GB 显存。关闭其他占用显存的软件后重试；仍然无法加载时，关闭 NInfer 并改用 GGUF 或在线推理。降低上下文不能解决模型权重本身装不进显存的问题。
+
+### 点击“中断任务”没有反应
+
+当前版本会在 GGUF 的每次解码、图片预处理、视频选帧与分段分析、NInfer 启动等待以及在线/API
+请求等待期间检查 ComfyUI 的原生中断标志。中断本地 NInfer 请求时，插件只会终止自己启动的引擎，
+不会关闭用户另外启动的服务。更新插件后必须完整重启 ComfyUI，旧进程不会热加载 Python 修改。
+
+### 怎样减少模型启动等待？
+
+- 保持“推理后卸载模型”关闭：相同模型、思考模式和上下文容量会直接复用，不再重新读取权重。
+- NInfer 上下文会按本轮实际文字、模板和视觉事实自动选择 8K、16K、32K、64K、128K 或 256K 档位；开启思考模式时最低使用 16K，避免思考过程占满 8K 后没有最终输出。
+- 动态上下文采用“只升不降”的常驻复用策略：现有引擎容量足够时直接复用，不会因为下一轮输入变短而重启；只有新任务确实超过当前容量才扩容并重启一次。若模型仍因思考耗尽上下文而返回空结果，插件会自动扩大一档并重试一次。
+- 当前版本会缓存GPU配置、模型列表、mmproj列表和服务模型ID；已有可用的NInfer进程时，不再重复
+  调用硬件探测、扫描TCP连接或清理ComfyUI显存。
+- 只有确实需要启动新的NInfer进程时，才会释放ComfyUI模型显存。启动日志会显示本次引擎实际耗时。
+- 第一次加载27B NInfer仍需把大量权重从磁盘送入显存，这部分主要取决于模型所在磁盘速度；如果开启
+  “推理后卸载模型”，下一次任务必然重新加载，无法获得常驻复用加速。
 
 ### 为什么输出长度不是无限的？
 
@@ -284,6 +339,26 @@ Set-Location "path-to-ComfyUI"
 & ".\python_embeded\python.exe" -m pip install -U llama-cpp-python
 ```
 
+### Automatic GPU acceleration
+
+The plugin automatically registers llama.cpp's dynamic CUDA backend. It searches the plugin-owned
+`engine/llama-cuda-runtime` directory first, then ComfyUI's NVIDIA CUDA 13 Python runtime, the local
+CUDA Toolkit, and the official NVIDIA DriverStore. It never modifies Windows system directories.
+
+When CUDA is available, ComfyUI's idle model allocations are released before loading the GGUF.
+The plugin then selects full GPU, mixed GPU+CPU, or CPU fallback from currently available VRAM.
+In mixed mode, as many model layers as possible and the vision projector remain on GPU while CPU
+handles the remainder. Logs report the runtime source, GPU, offloaded layer count, vision device,
+and any automatic fallback.
+
+### Inference strategy and seed
+
+`Normal` follows the user text, template, and observed media facts conservatively. `Creative` enriches
+composition, camera, lighting, color, material, atmosphere, and style while preserving all hard constraints
+and visible facts. The seed uses ComfyUI's native Randomize, Increment, Decrement, and Fixed controls.
+Local GGUF, NInfer, online inference, images, and chronological video segments all receive the selected seed.
+If an online provider rejects the `seed` field, the plugin retries once without it and reports the fallback.
+
 ## Examples
 
 ### Text to prompt
@@ -308,3 +383,8 @@ Choose online inference and enter the provider's API URL, API key, and model ID.
 - RTX 30/20-series, AMD, Intel, and CPU-only systems should use GGUF or online inference.
 - Local image/video understanding requires a compatible vision GGUF plus mmproj.
 - The plugin removes common reasoning blocks by default and does not impose a fixed 1024-token output cap; runtime and provider limits still apply.
+- ComfyUI's Interrupt button is polled during GGUF decoding, media preprocessing, video segment analysis,
+  local-engine startup, and API waits. Cancelling a local request terminates only an engine owned by this plugin.
+- Leave `Unload model after inference` disabled for the fastest repeated requests. Hardware discovery, model/mmproj
+  scans, service model IDs, and compatible resident engines are cached; ComfyUI VRAM is released only when a new
+  NInfer process really has to start.

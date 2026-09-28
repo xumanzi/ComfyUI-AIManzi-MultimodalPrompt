@@ -6,17 +6,24 @@ config/settings.json，避免把硬件/服务参数塞进工作流。
 from __future__ import annotations
 
 import base64
+import ctypes
+import functools
 import gc
+import hashlib
 import http.client
 import io
 import json
 import os
 import re
+import struct
 import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import zipfile
+from collections import OrderedDict
 from urllib.parse import urlsplit
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -28,6 +35,13 @@ try:
     import folder_paths
 except ImportError:
     folder_paths = None
+
+try:
+    from aiohttp import web
+    from server import PromptServer
+except ImportError:
+    web = None
+    PromptServer = None
 
 try:
     import torch
@@ -48,6 +62,10 @@ VIDEO_ANALYSIS_LIMITS = {
     "完整逐帧（最多256帧）": 256,
 }
 VIDEO_SEGMENT_FRAMES = 8
+VISUAL_FACT_CACHE_ITEMS = 64
+FINAL_OUTPUT_CACHE_ITEMS = 32
+SEED_MAX = 0xFFFFFFFF
+INFERENCE_STRATEGIES = ("普通推理", "创新推理")
 SKILL_MAX_FILES = 500
 SKILL_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 SKILL_MAX_TEXT_FILE_BYTES = 1024 * 1024
@@ -98,9 +116,7 @@ def _settings() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "llm_roots": [str(default_llm_root)],
         "ninfer_api_base": "http://127.0.0.1:8080/v1",
-        "llama_api_base": "http://127.0.0.1:8082/v1",
         "request_timeout_seconds": 600,
-        "llama_server_command": "",
     }
     try:
         defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
@@ -116,14 +132,30 @@ def _auto_context_tokens(text: str, image_count: int = 0, required_tokens: int |
     required_tokens here. Media has a reserve because vision token counts are model-dependent.
     """
     if required_tokens is None:
-        estimated_input = max(len(text), int(len(text.encode("utf-8")) * 0.80)) + image_count * 2048
+        # UTF-8 byte length badly overestimates Chinese (three bytes usually map to
+        # roughly one token), causing harmless templates to jump to a 64K/128K KV
+        # allocation. Count CJK and non-CJK separately and retain a safety margin;
+        # the exact-token overflow path below still grows and reloads once if needed.
+        cjk_count = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", text))
+        non_cjk_count = max(0, len(text) - cjk_count)
+        estimated_input = int((cjk_count * 1.15) + (non_cjk_count / 3.2) + 256) + image_count * 2048
     else:
         estimated_input = required_tokens
-    needed = estimated_input + max(AUTO_CONTEXT_MIN, estimated_input) + 512
+    # Reserve useful generation room without assuming that every long input also
+    # needs an equally long answer. max_tokens=None can still consume all remaining
+    # context, and the overflow retry protects unusual chat templates.
+    output_reserve = max(AUTO_CONTEXT_MIN, min(16384, estimated_input // 2))
+    needed = estimated_input + output_reserve + 512
     context = AUTO_CONTEXT_MIN
     while context < needed and context < AUTO_CONTEXT_MAX:
         context *= 2
     return min(context, AUTO_CONTEXT_MAX)
+
+
+def _ninfer_context_tokens(text: str, thinking: bool) -> int:
+    """Reserve enough room for NInfer reasoning to reach a visible final answer."""
+    context = _auto_context_tokens(text, 0)
+    return max(context, 16384 if thinking else AUTO_CONTEXT_MIN)
 
 
 def _roots() -> list[Path]:
@@ -135,6 +167,7 @@ def _roots() -> list[Path]:
     return result
 
 
+@functools.lru_cache(maxsize=1)
 def _scan_models() -> list[str]:
     models: list[str] = []
     for root in _roots():
@@ -143,17 +176,6 @@ def _scan_models() -> list[str]:
                     and not path.name.lower().startswith("mmproj")):
                 models.append(str(path))
     return sorted(models, key=lambda p: (Path(p).suffix.lower(), Path(p).name.lower())) or ["未找到模型"]
-
-
-def _vision_candidates() -> list[str]:
-    candidates: list[str] = ["自动（使用主模型，如具备视觉能力）"]
-    for model in _scan_models():
-        lower = model.lower()
-        parent = Path(model).parent
-        is_gguf_vision = Path(model).suffix.lower() == ".gguf" and bool(any(parent.glob("*mmproj*.gguf")))
-        if is_gguf_vision or any(token in lower for token in ("vl", "vision", "florence", "llava", "cog")):
-            candidates.append(model)
-    return candidates
 
 
 def _model_choices() -> list[str]:
@@ -168,6 +190,7 @@ def _display_model_name(path: Path) -> str:
     return path.name
 
 
+@functools.lru_cache(maxsize=1)
 def _mmproj_files() -> list[str]:
     files: list[str] = []
     for root in _roots():
@@ -229,16 +252,48 @@ def _json_request(
         headers=request_headers,
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"推理服务返回 HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接推理服务：{exc.reason}") from exc
-    except (ConnectionError, OSError, http.client.HTTPException) as exc:
-        raise RuntimeError(f"推理服务连接被中断：{exc}") from exc
+    finished = threading.Event()
+    result: dict[str, Any] = {}
+    failure: list[BaseException] = []
+
+    def send() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result.update(json.loads(response.read().decode("utf-8")))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            failure.append(RuntimeError(f"推理服务返回 HTTP {exc.code}: {detail}"))
+        except urllib.error.URLError as exc:
+            failure.append(RuntimeError(f"无法连接推理服务：{exc.reason}"))
+        except (ConnectionError, OSError, http.client.HTTPException) as exc:
+            failure.append(RuntimeError(f"推理服务连接被中断：{exc}"))
+        except BaseException as exc:
+            failure.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=send, name="AIManzi-HTTP", daemon=True)
+    worker.start()
+    while not finished.wait(0.1):
+        if _processing_interrupted():
+            endpoint = urlsplit(url)
+            if endpoint.hostname in {"127.0.0.1", "localhost", "::1"}:
+                # Stopping a plugin-owned local engine cancels its in-flight generation
+                # and also releases VRAM. Never terminate a user-owned external server.
+                for kind, process in list(_OWNED_SERVERS.items()):
+                    if _process_is_running(process):
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                        _OWNED_SERVERS.pop(kind, None)
+                        _OWNED_SERVER_SPECS.pop(kind, None)
+                        _SERVER_MODEL_IDS.clear()
+            _throw_if_interrupted()
+    _throw_if_interrupted()
+    if failure:
+        raise failure[0]
+    return result
 
 
 def _user_requests_reasoning(text: str) -> bool:
@@ -276,25 +331,144 @@ def _clean_answer(value: Any, allow_reasoning: bool = False) -> str:
     return answer
 
 
+def _inference_profile(strategy: str, observation_mode: bool = False) -> tuple[float, float, str]:
+    """Return sampling and instruction policy without exposing internal reasoning."""
+    if observation_mode:
+        return 0.2, 0.8, (
+            "只记录媒体中实际可见的事实，保持客观和低随机性；不要补写画面中不存在的内容。"
+        )
+    if strategy == "创新推理":
+        return 0.9, 0.95, (
+            "在完整保留用户硬性要求、模板规则和媒体事实的前提下，主动进行合理的创意联想与拓展。"
+            "可增强主体细节、环境、构图、镜头、光线、色彩、材质、氛围、叙事感和艺术风格，"
+            "但不得改变主体身份与数量、指定文字、关键动作或其他明确约束。"
+        )
+    return 0.55, 0.85, (
+        "严格依据用户输入、模板规则和媒体事实执行，不主动添加未经要求的主体、情节或物体；"
+        "优先保证准确、稳定和可控。"
+    )
+
+
 def _server_model_id(api_base: str, fallback: str) -> str:
     """NInfer exposes its artifact model id; use it instead of the local filename."""
+    cached = _SERVER_MODEL_IDS.get(api_base)
+    if cached:
+        return cached
     try:
         with urllib.request.urlopen(api_base.rstrip("/") + "/models", timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
         model_id = data.get("data", [{}])[0].get("id")
-        return str(model_id) if model_id else fallback
+        resolved = str(model_id) if model_id else fallback
+        _SERVER_MODEL_IDS[api_base] = resolved
+        return resolved
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         return fallback
 
 
 _OWNED_SERVERS: dict[str, subprocess.Popen[str]] = {}
 _OWNED_SERVER_SPECS: dict[str, tuple[str, bool, bool, str, int]] = {}
-_LLAMA_CPP_MODELS: dict[tuple[str, str, bool, int], Any] = {}
+_SERVER_MODEL_IDS: dict[str, str] = {}
+_LLAMA_CPP_MODELS: dict[tuple[str, str, bool, int, str, int], Any] = {}
+_VISUAL_FACT_CACHE: OrderedDict[str, str] = OrderedDict()
+_VISUAL_FACT_CACHE_LOCK = threading.Lock()
+_FINAL_OUTPUT_CACHE: OrderedDict[str, str] = OrderedDict()
+_FINAL_OUTPUT_CACHE_LOCK = threading.Lock()
+_DLL_DIRECTORY_HANDLES: list[Any] = []
+_LLAMA_BACKEND_STATE: dict[str, Any] | None = None
+
+
+def _path_identity(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        stat = path.stat()
+        return f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    except OSError:
+        return str(path)
+
+
+def _visual_cache_key(namespace: str, media_urls: list[str], *parts: Any) -> str:
+    digest = hashlib.sha256()
+    digest.update(namespace.encode("utf-8"))
+    for part in parts:
+        digest.update(b"\0")
+        digest.update(str(part).encode("utf-8"))
+    for url in media_urls:
+        digest.update(b"\1")
+        digest.update(url.encode("ascii", errors="strict"))
+    return digest.hexdigest()
+
+
+def _visual_cache_get(key: str) -> str | None:
+    with _VISUAL_FACT_CACHE_LOCK:
+        value = _VISUAL_FACT_CACHE.pop(key, None)
+        if value is not None:
+            _VISUAL_FACT_CACHE[key] = value
+        return value
+
+
+def _visual_cache_put(key: str, value: str) -> None:
+    with _VISUAL_FACT_CACHE_LOCK:
+        _VISUAL_FACT_CACHE.pop(key, None)
+        _VISUAL_FACT_CACHE[key] = value
+        while len(_VISUAL_FACT_CACHE) > VISUAL_FACT_CACHE_ITEMS:
+            _VISUAL_FACT_CACHE.popitem(last=False)
+
+
+def _final_cache_get(key: str) -> str | None:
+    with _FINAL_OUTPUT_CACHE_LOCK:
+        value = _FINAL_OUTPUT_CACHE.pop(key, None)
+        if value is not None:
+            _FINAL_OUTPUT_CACHE[key] = value
+        return value
+
+
+def _final_cache_put(key: str, value: str) -> None:
+    with _FINAL_OUTPUT_CACHE_LOCK:
+        _FINAL_OUTPUT_CACHE.pop(key, None)
+        _FINAL_OUTPUT_CACHE[key] = value
+        while len(_FINAL_OUTPUT_CACHE) > FINAL_OUTPUT_CACHE_ITEMS:
+            _FINAL_OUTPUT_CACHE.popitem(last=False)
+
+
+def _processing_interrupted() -> bool:
+    """Read ComfyUI's global cancel flag without consuming it."""
+    try:
+        import comfy.model_management as model_management
+
+        return bool(model_management.processing_interrupted())
+    except (ImportError, AttributeError):
+        return False
+
+
+def _throw_if_interrupted() -> None:
+    """Raise ComfyUI's native interruption exception so the queue stops cleanly."""
+    try:
+        import comfy.model_management as model_management
+
+        model_management.throw_exception_if_processing_interrupted()
+    except (ImportError, AttributeError):
+        return
+
+
+def _install_llama_interrupt_callback(llm: Any) -> None:
+    """Make llama_decode poll ComfyUI's Stop/Interrupt button during GPU or CPU work."""
+    try:
+        from llama_cpp import llama_cpp as llama_cpp_lib
+
+        callback = llama_cpp_lib.ggml_abort_callback(lambda _data: _processing_interrupted())
+        raw_context = getattr(llm.ctx, "ctx", llm.ctx)
+        llama_cpp_lib.llama_set_abort_callback(raw_context, callback, None)
+        # ctypes callbacks must remain strongly referenced for the lifetime of the C context.
+        llm._aimanzi_interrupt_callback = callback
+    except (ImportError, AttributeError, TypeError) as exc:
+        print(f"[AI蛮子] 警告：当前 llama-cpp-python 无法安装中断回调：{exc}")
 
 
 def _server_alive(api_base: str, attempts: int = 1, retry_delay: float = 0.2) -> bool:
     """Tolerate transient Windows socket resets during engine startup/reload."""
     for attempt in range(max(1, attempts)):
+        _throw_if_interrupted()
         try:
             with urllib.request.urlopen(api_base.rstrip("/") + "/models", timeout=2):
                 return True
@@ -368,6 +542,7 @@ def _process_is_running(process: Any) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
 def _bundled_ninfer_profile() -> dict[str, Any]:
     """Return the packaged NInfer profile for this GPU; never search user disks for an engine."""
     try:
@@ -395,10 +570,6 @@ def _bundled_ninfer_profile() -> dict[str, Any]:
     return profile
 
 
-def _bundled_ninfer_engine() -> Path:
-    return _bundled_ninfer_profile()["engine"]
-
-
 def _effective_ninfer_context(vision: bool, context_tokens: int) -> int:
     """Return the actual capacity passed to the selected bundled engine."""
     profile = _bundled_ninfer_profile()
@@ -406,6 +577,7 @@ def _effective_ninfer_context(vision: bool, context_tokens: int) -> int:
     return min(max(AUTO_CONTEXT_MIN, int(context_tokens)), limit)
 
 
+@functools.lru_cache(maxsize=1)
 def _bundled_ninfer_environment() -> dict[str, str]:
     runtime = PLUGIN_DIR / "engine" / "runtime"
     if not (runtime / "VCRUNTIME140.dll").is_file() or not (runtime / "MSVCP140.dll").is_file():
@@ -458,23 +630,28 @@ def _bundled_ninfer_command(model: Path, vision: bool, thinking: bool, context_t
     return command
 
 
-def _ensure_server(kind: str, model: Path, vision: bool, mmproj: Path | None = None, thinking: bool = True, context_tokens: int = AUTO_CONTEXT_MIN) -> None:
+def _ensure_ninfer_server(model: Path, vision: bool, thinking: bool = True, context_tokens: int = AUTO_CONTEXT_MIN) -> None:
     """Start only a server created by this plugin. Never terminate an unknown user service."""
+    kind = "ninfer"
     settings = _settings()
-    api_base = settings["ninfer_api_base"] if kind == "ninfer" else settings["llama_api_base"]
+    api_base = settings["ninfer_api_base"]
     # Keep the recorded capacity identical to the command line.  In particular,
     # visual NInfer has a smaller hardware profile cap than text-only NInfer.
-    if kind == "ninfer":
-        context_tokens = _effective_ninfer_context(vision, context_tokens)
-    spec = (str(model), vision, thinking, str(mmproj or ""), context_tokens)
+    context_tokens = _effective_ninfer_context(vision, context_tokens)
+    spec = (str(model), vision, thinking, "", context_tokens)
     old = _OWNED_SERVERS.get(kind)
-    healthy = _server_alive(api_base, attempts=3)
-    orphan = _orphaned_bundled_ninfer(api_base) if kind == "ninfer" else None
+    old_running = bool(old and _process_is_running(old))
+    # Enumerating every TCP connection through psutil is useful only after a
+    # ComfyUI restart, when this process no longer has its Popen handle.
+    orphan = _orphaned_bundled_ninfer(api_base) if not old_running else None
 
     # A process can own/listen on the port while briefly resetting health-check
     # connections.  Inspect the process before deciding to launch another copy.
     # This prevents a transient WinError 10054 from turning into a port conflict.
-    existing = old if old and _process_is_running(old) else orphan
+    existing = old if old_running else orphan
+    # A cold port normally refuses immediately. Avoid two unnecessary 200ms retry
+    # sleeps on the first launch; retain retries only when a real process exists.
+    healthy = _server_alive(api_base, attempts=3 if existing is not None else 1)
     if existing is not None:
         if existing is old:
             old_spec = _OWNED_SERVER_SPECS.get(kind)
@@ -489,12 +666,14 @@ def _ensure_server(kind: str, model: Path, vision: bool, mmproj: Path | None = N
             compatible = _orphaned_ninfer_matches(existing, model, vision, thinking, context_tokens)
         if compatible:
             if healthy:
+                print(f"[AI蛮子] {kind} 引擎已就绪，复用常驻模型，跳过重新加载。")
                 return
             # Allow a busy/reloading service to recover without starting or
             # killing another engine.  Repeated connection resets become a
             # controlled diagnostic instead of leaking a raw socket exception.
             recovery_deadline = time.time() + 15
             while time.time() < recovery_deadline and _process_is_running(existing):
+                _throw_if_interrupted()
                 if _server_alive(api_base, attempts=2):
                     return
                 time.sleep(0.5)
@@ -513,43 +692,37 @@ def _ensure_server(kind: str, model: Path, vision: bool, mmproj: Path | None = N
                     existing.wait(timeout=10)
                 except Exception:
                     pass
+            _SERVER_MODEL_IDS.pop(api_base, None)
     elif healthy:
         # A healthy service not owned by this plugin is intentionally reused.
         return
-    if kind == "ninfer":
-        command: str | list[str] = _bundled_ninfer_command(model, vision, thinking, context_tokens)
-        shell = False
-    else:
-        command_template = settings.get("llama_server_command", "").strip()
-        if not command_template:
-            raise RuntimeError(
-                "llama 服务未运行。请先启动服务，或在 config/settings.json 的 "
-                "llama_server_command 中配置启动模板。"
-            )
-        command = command_template.format(model=str(model), mmproj=str(mmproj or ""), vision="--vision" if vision else "")
-        shell = True
-    if kind != "ninfer" and not command:
-        raise RuntimeError(
-            f"{kind} 服务未运行。请先启动服务，或在 config/settings.json 的 "
-            f"{kind}_server_command 中配置启动模板。"
-        )
+    command = _bundled_ninfer_command(model, vision, thinking, context_tokens)
     if old and old.poll() is None:
         old.terminate()
+    # Only pay the ComfyUI unload/cache-collection cost when a new 27B process
+    # will actually be launched. A compatible resident engine returns above.
+    _release_comfy_vram_for_ninfer()
+    with _FINAL_OUTPUT_CACHE_LOCK:
+        _FINAL_OUTPUT_CACHE.clear()
+    _SERVER_MODEL_IDS.pop(api_base, None)
     log_path = PLUGIN_DIR / "engine" / f"{kind}-startup.log"
+    started_at = time.perf_counter()
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} start ---\n")
         _OWNED_SERVERS[kind] = subprocess.Popen(
             command,
-            shell=shell,
+            shell=False,
             cwd=str(PLUGIN_DIR),
-            env=_bundled_ninfer_environment() if kind == "ninfer" else None,
+            env=_bundled_ninfer_environment(),
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
     _OWNED_SERVER_SPECS[kind] = spec
     deadline = time.time() + 120
     while time.time() < deadline:
+        _throw_if_interrupted()
         if _server_alive(api_base):
+            print(f"[AI蛮子] {kind} 引擎启动完成，用时 {time.perf_counter() - started_at:.2f} 秒。")
             return
         # Do not make the workflow wait a full two minutes for a deterministic
         # load failure such as insufficient VRAM or a missing DLL.
@@ -557,14 +730,11 @@ def _ensure_server(kind: str, model: Path, vision: bool, mmproj: Path | None = N
             detail = _startup_log_tail(kind)
             _OWNED_SERVERS.pop(kind, None)
             _OWNED_SERVER_SPECS.pop(kind, None)
-            if kind == "ninfer":
-                raise _ninfer_startup_error(detail)
-            raise RuntimeError(f"{kind} 服务启动后已退出。引擎日志：\n{detail}")
-        time.sleep(0.5)
+            raise _ninfer_startup_error(detail)
+        elapsed = time.perf_counter() - started_at
+        time.sleep(0.1 if elapsed < 5 else 0.25)
     detail = _startup_log_tail(kind)
-    if kind == "ninfer":
-        raise _ninfer_startup_error(detail, timed_out=True)
-    raise RuntimeError(f"{kind} 服务启动超时。引擎日志：\n{detail}")
+    raise _ninfer_startup_error(detail, timed_out=True)
 
 
 def _unload_plugin_model(kind: str | None) -> None:
@@ -584,6 +754,7 @@ def _unload_plugin_model(kind: str | None) -> None:
                 process.kill()
         _OWNED_SERVERS.pop(kind, None)
         _OWNED_SERVER_SPECS.pop(kind, None)
+        _SERVER_MODEL_IDS.clear()
     for loaded in _LLAMA_CPP_MODELS.values():
         try:
             loaded.close()
@@ -626,6 +797,238 @@ def _release_comfy_vram_for_ninfer() -> None:
             pass
 
 
+def _cuda_runtime_directories() -> list[tuple[Path, str]]:
+    """Return trusted CUDA runtime locations in priority order.
+
+    The plugin-owned directory allows release packages to carry NVIDIA's
+    redistributable CUDA runtime without modifying ComfyUI or Windows.  Normal
+    ComfyUI installations already contain the same CUDA libraries beside
+    PyTorch, so reuse them before looking at an optional system CUDA toolkit.
+    The NVIDIA driver-only hybrid runtime is discovered in DriverStore because
+    it is part of the installed display driver and must not be downloaded from
+    an arbitrary DLL website.
+    """
+    candidates: list[tuple[Path, str]] = [
+        (PLUGIN_DIR / "engine" / "llama-cuda-runtime", "插件内置运行库"),
+    ]
+    for base in (Path(sys.prefix), Path(sys.executable).resolve().parent):
+        candidates.extend(
+            [
+                (
+                base / "Lib" / "site-packages" / "nvidia" / "cu13" / "bin" / "x86_64",
+                "ComfyUI CUDA 13 运行库",
+                ),
+                (
+                base / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
+                "ComfyUI NVIDIA Python 运行库",
+                ),
+            ]
+        )
+    cuda_path = os.environ.get("CUDA_PATH", "").strip()
+    if cuda_path:
+        candidates.extend(
+            [
+                (Path(cuda_path) / "bin" / "x64", "系统 CUDA Toolkit"),
+                (Path(cuda_path) / "bin", "系统 CUDA Toolkit"),
+            ]
+        )
+    toolkit_root = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+    if toolkit_root.is_dir():
+        for version in sorted(toolkit_root.glob("v*"), reverse=True):
+            candidates.extend(
+                [
+                    (version / "bin" / "x64", f"CUDA Toolkit {version.name}"),
+                    (version / "bin", f"CUDA Toolkit {version.name}"),
+                ]
+            )
+    driver_store = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "DriverStore" / "FileRepository"
+    if driver_store.is_dir():
+        for dll in driver_store.glob("nv*_amd64_*/*nvcudart_hybrid64.dll"):
+            candidates.append((dll.parent, "NVIDIA 驱动运行库"))
+
+    result: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for path, label in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if resolved.is_dir() and key not in seen:
+            seen.add(key)
+            result.append((resolved, label))
+    return result
+
+
+def _prepare_llama_backend() -> dict[str, Any]:
+    """Load llama.cpp's dynamic CUDA backend before the first model is built."""
+    global _LLAMA_BACKEND_STATE
+    if _LLAMA_BACKEND_STATE is not None:
+        return _LLAMA_BACKEND_STATE
+
+    state: dict[str, Any] = {
+        "gpu": False,
+        "device": "CPU",
+        "runtime_sources": [],
+        "reason": "CUDA 后端不可用",
+    }
+    runtime_dirs = _cuda_runtime_directories() if os.name == "nt" else []
+    for runtime_dir, label in runtime_dirs:
+        try:
+            if os.name == "nt" and hasattr(os, "add_dll_directory"):
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(runtime_dir)))
+            os.environ["PATH"] = str(runtime_dir) + os.pathsep + os.environ.get("PATH", "")
+            if any(runtime_dir.glob("cublas64_*.dll")) or any(runtime_dir.glob("nvcudart_hybrid64.dll")):
+                state["runtime_sources"].append(label)
+        except OSError:
+            continue
+
+    try:
+        import llama_cpp
+
+        llama_cpp.llama_cpp.llama_backend_init()
+        lib_dir = Path(llama_cpp.llama_cpp.__file__).resolve().parent / "lib"
+        try:
+            from llama_cpp._ggml import ggml_backend_load_all_from_path
+
+            ggml_backend_load_all_from_path(ctypes.c_char_p(str(lib_dir).encode("utf-8")))
+        except ImportError:
+            # Older statically-linked CUDA wheels do not expose the dynamic loader;
+            # llama_supports_gpu_offload() below still reports their GPU capability.
+            pass
+        state["gpu"] = bool(llama_cpp.llama_cpp.llama_supports_gpu_offload())
+        if state["gpu"]:
+            state["reason"] = ""
+            if torch is not None and torch.cuda.is_available():
+                state["device"] = torch.cuda.get_device_name(0)
+            else:
+                state["device"] = "CUDA GPU"
+        else:
+            cuda_dll = lib_dir / "ggml-cuda.dll"
+            state["reason"] = (
+                "llama.cpp CUDA 动态后端未注册"
+                if cuda_dll.is_file()
+                else "当前 llama-cpp-python 未包含 ggml-cuda.dll"
+            )
+    except Exception as exc:
+        state["reason"] = f"CUDA 后端加载失败：{exc}"
+
+    sources = "、".join(dict.fromkeys(state["runtime_sources"])) or "无"
+    if state["gpu"]:
+        print(f"[AI蛮子] GGUF 后端：CUDA / {state['device']}；运行库来源：{sources}")
+    else:
+        print(f"[AI蛮子] GGUF 后端：CPU；原因：{state['reason']}；已检查运行库：{sources}")
+    _LLAMA_BACKEND_STATE = state
+    return state
+
+
+def _gguf_block_count(model_path: Path) -> int:
+    """Read an early GGUF block-count field without mapping the multi-GB tensor table."""
+    try:
+        with model_path.open("rb") as stream:
+            if stream.read(4) != b"GGUF":
+                return 0
+            version = struct.unpack("<I", stream.read(4))[0]
+            if version not in (2, 3):
+                return 0
+            stream.read(8)  # tensor count
+            metadata_count = struct.unpack("<Q", stream.read(8))[0]
+
+            def read_string() -> str:
+                length = struct.unpack("<Q", stream.read(8))[0]
+                return stream.read(length).decode("utf-8", errors="replace")
+
+            scalar_formats = {
+                0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+                6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d",
+            }
+
+            def skip_value(value_type: int) -> None:
+                if value_type in scalar_formats:
+                    stream.seek(struct.calcsize(scalar_formats[value_type]), 1)
+                elif value_type == 8:
+                    length = struct.unpack("<Q", stream.read(8))[0]
+                    stream.seek(length, 1)
+                elif value_type == 9:
+                    element_type = struct.unpack("<I", stream.read(4))[0]
+                    count = struct.unpack("<Q", stream.read(8))[0]
+                    if element_type in scalar_formats:
+                        stream.seek(struct.calcsize(scalar_formats[element_type]) * count, 1)
+                    else:
+                        for _ in range(count):
+                            skip_value(element_type)
+                else:
+                    raise ValueError(f"unsupported GGUF value type: {value_type}")
+
+            for _ in range(min(metadata_count, 64)):
+                key = read_string()
+                value_type = struct.unpack("<I", stream.read(4))[0]
+                if value_type in scalar_formats:
+                    fmt = scalar_formats[value_type]
+                    value = struct.unpack(fmt, stream.read(struct.calcsize(fmt)))[0]
+                    if key.endswith(".block_count"):
+                        return int(value)
+                elif value_type == 8:
+                    read_string()
+                else:
+                    skip_value(value_type)
+    except (OSError, EOFError, struct.error, ValueError):
+        pass
+    return 0
+
+
+def _gpu_layer_plan(model_path: Path, mmproj: Path | None, context_tokens: int) -> tuple[list[int], str]:
+    """Plan full GPU first, then progressively mixed GPU/CPU fallbacks."""
+    backend = _prepare_llama_backend()
+    if not backend["gpu"]:
+        return [0], str(backend["reason"])
+
+    blocks = _gguf_block_count(model_path)
+    free_bytes = 0
+    if torch is not None and torch.cuda.is_available():
+        try:
+            free_bytes = int(torch.cuda.mem_get_info()[0])
+        except Exception:
+            pass
+    # Qwen3-VL 4B uses about 144 KiB of f16 KV per token.  Reserve this plus
+    # the projector and 768 MiB for CUDA workspaces/ComfyUI interoperability.
+    kv_reserve = min(context_tokens, 32768) * 160 * 1024
+    projector_reserve = int(mmproj.stat().st_size * 1.15) if mmproj and mmproj.is_file() else 0
+    safety_reserve = 768 * 1024 * 1024
+    usable = max(0, free_bytes - kv_reserve - projector_reserve - safety_reserve)
+    model_bytes = max(1, model_path.stat().st_size)
+    fraction = min(1.0, usable / model_bytes) if free_bytes else 1.0
+
+    if blocks:
+        estimated = max(1, min(blocks, int(blocks * fraction)))
+        plan = [-1] if estimated >= blocks else [estimated]
+        plan.extend(
+            candidate
+            for candidate in (int(blocks * ratio) for ratio in (0.75, 0.5, 0.25))
+            if candidate < estimated
+        )
+    else:
+        plan = [-1, 32, 24, 16, 8]
+    plan.append(0)
+    unique: list[int] = []
+    for item in plan:
+        if item not in unique and (item == -1 or item >= 0):
+            unique.append(item)
+    free_gib = free_bytes / (1024 ** 3) if free_bytes else 0.0
+    return unique, f"可用显存 {free_gib:.2f} GiB，计划 GPU 层 {unique}"
+
+
+def _gpu_retryable_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "cuda", "out of memory", "allocation", "alloc", "buffer", "vram",
+            "not enough memory", "显存", "内存不足",
+        )
+    )
+
+
 def _resize_media_to_budget(
     image_urls: list[str], total_pixels: int, max_item_pixels: int | None = None,
 ) -> list[str]:
@@ -638,6 +1041,7 @@ def _resize_media_to_budget(
     per_item = max(256 * 256, per_item)
     output: list[str] = []
     for url in image_urls:
+        _throw_if_interrupted()
         try:
             _, encoded = url.split(",", 1)
             with Image.open(io.BytesIO(base64.b64decode(encoded))) as source:
@@ -667,7 +1071,30 @@ def _api_chat(
     allow_reasoning: bool = False,
     api_key: str = "",
     observation_mode: bool = False,
+    inference_strategy: str = "普通推理",
+    seed: int = 0,
 ) -> str:
+    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
+    seed = int(seed) & SEED_MAX
+    parsed_base = urlsplit(api_base)
+    local_service = parsed_base.hostname in {"127.0.0.1", "localhost", "::1"}
+    response_cache_key = None
+    if local_service:
+        response_cache_key = _visual_cache_key(
+            "local-api-output-v1",
+            image_urls,
+            api_base.rstrip("/"),
+            model,
+            instruction,
+            allow_reasoning,
+            observation_mode,
+            inference_strategy,
+            seed,
+        )
+        cached_answer = _final_cache_get(response_cache_key)
+        if cached_answer is not None:
+            print("[AI蛮子] 完全相同的本地 API 请求缓存命中，跳过重复生成。")
+            return cached_answer
     result: dict[str, Any] | None = None
     levels = NINFER_VISION_LEVELS if image_urls else ((0, 0),)
     last_error: RuntimeError | None = None
@@ -697,11 +1124,14 @@ def _api_chat(
                             "不得把模板中的示例描述当成画面内容，也绝不能要求用户再次上传媒体。"
                             if resized_urls else ""
                         )
+                        + " " + strategy_instruction
                     ),
                 },
                 {"role": "user", "content": content},
             ],
-            "temperature": 0.7,
+            "temperature": temperature,
+            "top_p": top_p,
+            "seed": seed,
             "stream": False,
         }
         try:
@@ -717,13 +1147,51 @@ def _api_chat(
             )
             break
         except RuntimeError as exc:
+            seed_error = str(exc).lower()
+            if "seed" in seed_error and any(
+                marker in seed_error
+                for marker in (
+                    "unsupported", "unknown", "unrecognized", "not allowed", "not permitted",
+                    "unexpected", "extra_forbidden", "不支持", "未知",
+                )
+            ):
+                # Some OpenAI-compatible providers reject the otherwise standard
+                # seed field. Retry once without it instead of failing the workflow.
+                payload.pop("seed", None)
+                print("[AI蛮子] 当前在线服务不支持 seed 参数，本次已自动无种子重试。")
+                try:
+                    result = _json_request(
+                        endpoint,
+                        payload,
+                        int(_settings()["request_timeout_seconds"]),
+                        auth_headers,
+                    )
+                    break
+                except RuntimeError as retry_exc:
+                    exc = retry_exc
             last_error = exc
             if "media_budget_exceeded" not in str(exc) or attempt == len(levels) - 1:
                 raise
     if result is None:
         raise last_error or RuntimeError("推理服务没有返回结果。")
     try:
-        return _clean_answer(result["choices"][0]["message"]["content"], allow_reasoning)
+        choice = result["choices"][0]
+        message = choice["message"]
+        raw_content = message.get("content", "") if isinstance(message, dict) else ""
+        answer = _clean_answer(raw_content, allow_reasoning)
+        if not answer:
+            reasoning = ""
+            if isinstance(message, dict):
+                reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "").strip()
+            finish_reason = str(choice.get("finish_reason", "")) if isinstance(choice, dict) else ""
+            finish_lower = finish_reason.lower()
+            if reasoning or "context" in finish_lower or finish_lower in {"length", "max_tokens"}:
+                raise RuntimeError(
+                    "模型的思考过程已占满当前上下文，尚未生成最终答案。[empty_final_after_reasoning]"
+                )
+        if answer and response_cache_key:
+            _final_cache_put(response_cache_key, answer)
+        return answer
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"推理服务返回了无法识别的内容：{result}") from exc
 
@@ -799,6 +1267,7 @@ def _select_video_frame_indexes(images: Any, precision: str) -> list[int]:
         scores: list[tuple[float, int]] = []
         previous = _video_frame_signature(batch[0])
         for index in range(1, count):
+            _throw_if_interrupted()
             current = _video_frame_signature(batch[index])
             common_h = min(previous.shape[0], current.shape[0])
             common_w = min(previous.shape[1], current.shape[1])
@@ -816,7 +1285,10 @@ def _select_video_frame_indexes(images: Any, precision: str) -> list[int]:
 def _video_frame_urls(images: Any, precision: str, max_pixels: int = 768 * 768) -> tuple[list[str], list[int], int]:
     batch = _video_batch(images)
     indexes = _select_video_frame_indexes(batch, precision)
-    urls = [_tensor_data_url(batch[index], max_pixels) for index in indexes]
+    urls: list[str] = []
+    for index in indexes:
+        _throw_if_interrupted()
+        urls.append(_tensor_data_url(batch[index], max_pixels))
     return urls, indexes, int(batch.shape[0])
 
 
@@ -835,25 +1307,47 @@ def _video_segment_instruction(
 
 
 def _video_facts_from_frames(
-    frame_urls: list[str], frame_indexes: list[int], total_frames: int, user_instruction: str, analyze_segment: Any,
+    frame_urls: list[str], frame_indexes: list[int], total_frames: int, user_instruction: str,
+    analyze_segment: Any, base_seed: int = 0, cache_namespace: str | None = None,
 ) -> str:
     """Analyze chronological chunks, then return compact evidence for final synthesis."""
     if not frame_urls:
         raise ValueError("视频 IMAGE 批次为空。")
+    cache_key = None
+    if cache_namespace:
+        cache_key = _visual_cache_key(
+            cache_namespace,
+            frame_urls,
+            tuple(frame_indexes),
+            total_frames,
+            user_instruction,
+            int(base_seed) & SEED_MAX,
+            VIDEO_SEGMENT_FRAMES,
+        )
+        cached = _visual_cache_get(cache_key)
+        if cached is not None:
+            print("[AI蛮子] 视频视觉事实缓存命中，跳过重复逐帧识别。")
+            return cached
     segment_count = int(np.ceil(len(frame_urls) / VIDEO_SEGMENT_FRAMES))
     facts: list[str] = []
     for offset in range(0, len(frame_urls), VIDEO_SEGMENT_FRAMES):
+        _throw_if_interrupted()
         urls = frame_urls[offset:offset + VIDEO_SEGMENT_FRAMES]
         indexes = frame_indexes[offset:offset + VIDEO_SEGMENT_FRAMES]
         number = offset // VIDEO_SEGMENT_FRAMES + 1
         observation = analyze_segment(
             _video_segment_instruction(user_instruction, indexes, total_frames, number, segment_count),
             urls,
+            (int(base_seed) + number - 1) & SEED_MAX,
         )
+        _throw_if_interrupted()
         if not str(observation).strip():
             raise RuntimeError(f"视频第 {number}/{segment_count} 段没有返回有效识别结果。")
         facts.append(f"[时间段 {number}/{segment_count}，原始帧 {indexes[0] + 1}-{indexes[-1] + 1}]\n{observation.strip()}")
-    return "\n\n".join(facts)
+    result = "\n\n".join(facts)
+    if cache_key:
+        _visual_cache_put(cache_key, result)
+    return result
 
 
 def _find_mmproj(model_path: Path) -> Path | None:
@@ -891,7 +1385,7 @@ def _find_visual_bridge_model() -> tuple[Path, Path]:
     return model, mmproj
 
 
-def _ninfer_visual_facts(instruction: str, image_urls: list[str]) -> str:
+def _ninfer_visual_facts(instruction: str, image_urls: list[str], seed: int = 0) -> str:
     bridge_model, bridge_mmproj = _find_visual_bridge_model()
     grounded_media = _resize_media_to_budget(
         image_urls,
@@ -904,11 +1398,33 @@ def _ninfer_visual_facts(instruction: str, image_urls: list[str]) -> str:
         "未出现的对象，不要把下面的任务文字或模板示例当作画面内容。\n\n"
         "用户最终任务（仅用于确定观察重点）：\n" + instruction
     )
+    cache_key = _visual_cache_key(
+        "ninfer-image-bridge-v1",
+        grounded_media,
+        _path_identity(bridge_model),
+        _path_identity(bridge_mmproj),
+        observation_request,
+        # Visual observation is factual and intentionally independent from the
+        # final creative seed, so Random/Increment does not invalidate grounding.
+        0,
+    )
+    cached = _visual_cache_get(cache_key)
+    if cached is not None:
+        print("[AI蛮子] 图像视觉事实缓存命中，跳过重复视觉识别。")
+        return cached
     facts = _llamacpp_chat(
-        bridge_model, observation_request, grounded_media, bridge_mmproj, False, observation_mode=True
+        bridge_model,
+        observation_request,
+        grounded_media,
+        bridge_mmproj,
+        False,
+        observation_mode=True,
+        inference_strategy="普通推理",
+        seed=0,
     )
     if not facts.strip():
         raise RuntimeError("视觉桥接模型没有返回可用的图像/视频识别结果。")
+    _visual_cache_put(cache_key, facts)
     return facts
 
 
@@ -937,63 +1453,141 @@ def _llamacpp_chat(
     context_tokens: int | None = None,
     allow_reasoning: bool = False,
     observation_mode: bool = False,
+    inference_strategy: str = "普通推理",
+    seed: int = 0,
 ) -> str:
-    """Universal GGUF backend using ComfyUI's bundled llama-cpp-python CPU runtime.
-
-    It needs no separately installed llama-server. The current ComfyUI wheel is CPU-only, so it
-    works on all Windows devices; a CUDA/Vulkan wheel can later replace it without workflow edits.
-    """
+    """Universal GGUF backend with automatic CUDA, mixed, and CPU execution."""
     # ComfyUI/Torch can preload Intel OpenMP while the installed llama-cpp-python
     # wheel loads LLVM OpenMP.  Without this compatibility flag Windows aborts with
     # OMP Error #15 before any GGUF request can run.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    backend = _prepare_llama_backend()
     try:
         from llama_cpp import Llama
         from llama_cpp.llama_chat_format import Qwen3VLChatHandler, Qwen35ChatHandler
     except ImportError as exc:
         raise RuntimeError("关闭 NInfer 的 GGUF 推理需要 ComfyUI Python 中的 llama-cpp-python。") from exc
+    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
+    seed = int(seed) & SEED_MAX
     context_tokens = context_tokens or _auto_context_tokens(instruction, len(image_urls))
-    key = (str(model_path), str(mmproj or ""), thinking, context_tokens)
-    llm = _LLAMA_CPP_MODELS.get(key)
+    model_prefix = (str(model_path), str(mmproj or ""), thinking)
+    key: tuple[str, str, bool, int, str, int] | None = None
+    llm = None
+    compatible = [
+        (cached_key, cached_model)
+        for cached_key, cached_model in _LLAMA_CPP_MODELS.items()
+        if cached_key[:3] == model_prefix and cached_key[3] >= context_tokens
+    ]
+    if compatible:
+        # A larger already-loaded context can safely serve a smaller request. Choose
+        # the smallest compatible instance to minimize retained KV memory.
+        key, llm = min(compatible, key=lambda item: item[0][3])
+        if key[3] > context_tokens:
+            print(f"[AI蛮子] 复用已加载的 {key[3]} 上下文实例，跳过 {context_tokens} 上下文重载。")
     if llm is None:
-        handler = None
-        if image_urls:
-            if mmproj is None:
-                raise RuntimeError("图像或视频 GGUF 推理需要匹配的 mmproj 文件。")
-            lowered = model_path.name.lower()
-            if "qwen3.5" in lowered:
-                handler = Qwen35ChatHandler(
-                    clip_model_path=str(mmproj),
-                    enable_thinking=thinking,
-                    use_gpu=False,
+        if image_urls and mmproj is None:
+            raise RuntimeError("图像或视频 GGUF 推理需要匹配的 mmproj 文件。")
+        if backend["gpu"]:
+            # Do not leave a previously selected GGUF occupying VRAM while a new
+            # model/context is being loaded. Matching requests were returned from
+            # the cache above, so everything left here is safe to replace.
+            if _LLAMA_CPP_MODELS:
+                _unload_plugin_model(None)
+            # ComfyUI normally keeps diffusion models resident. Release those allocations
+            # before measuring capacity so llama.cpp can put the maximum safe layer count
+            # on GPU rather than needlessly falling back to CPU.
+            _release_comfy_vram_for_ninfer()
+        layer_plan, plan_detail = _gpu_layer_plan(model_path, mmproj if image_urls else None, context_tokens)
+        print(f"[AI蛮子] GGUF 显存规划：{plan_detail}")
+        attempts: list[tuple[int, bool]] = [(layers, bool(backend["gpu"])) for layers in layer_plan]
+        if backend["gpu"] and image_urls:
+            # Last-resort compatibility path when even the projector cannot fit on GPU.
+            attempts.append((0, False))
+        last_error: Exception | None = None
+        lowered = model_path.name.lower()
+        for layers, vision_gpu in attempts:
+            handler = None
+            candidate = None
+            try:
+                if image_urls:
+                    if "qwen3.5" in lowered:
+                        handler = Qwen35ChatHandler(
+                            clip_model_path=str(mmproj),
+                            enable_thinking=thinking,
+                            use_gpu=vision_gpu,
+                            verbose=False,
+                            image_min_tokens=1024,
+                        )
+                    elif "qwen" in lowered and "vl" in lowered:
+                        handler = Qwen3VLChatHandler(
+                            clip_model_path=str(mmproj),
+                            force_reasoning=thinking,
+                            use_gpu=vision_gpu,
+                            verbose=False,
+                            image_min_tokens=1024,
+                        )
+                    else:
+                        raise RuntimeError("当前仅内置 Qwen3-VL 与 Qwen3.5 GGUF 的视觉处理器。")
+                candidate = Llama(
+                    model_path=str(model_path),
+                    chat_handler=handler,
+                    n_ctx=context_tokens,
+                    n_gpu_layers=layers,
+                    n_threads=max(1, (os.cpu_count() or 4) - 1),
                     verbose=False,
-                    image_min_tokens=1024,
                 )
-            elif "qwen" in lowered and "vl" in lowered:
-                handler = Qwen3VLChatHandler(
-                    clip_model_path=str(mmproj),
-                    force_reasoning=thinking,
-                    use_gpu=False,
-                    verbose=False,
-                    image_min_tokens=1024,
-                )
-            else:
-                raise RuntimeError("当前仅内置 Qwen3-VL 与 Qwen3.5 GGUF 的视觉处理器。")
-        try:
-            llm = Llama(
-                model_path=str(model_path),
-                chat_handler=handler,
-                n_ctx=context_tokens,
-                n_gpu_layers=0,
-                n_threads=max(1, (os.cpu_count() or 4) - 1),
-                verbose=False,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"GGUF 模型加载失败：{exc}") from exc
-        _LLAMA_CPP_MODELS[key] = llm
+                _install_llama_interrupt_callback(candidate)
+                llm = candidate
+                mode = "全 GPU" if layers == -1 else ("GPU+CPU 混合" if layers > 0 or vision_gpu else "纯 CPU")
+                layer_text = "全部" if layers == -1 else str(layers)
+                vision_text = "GPU" if image_urls and vision_gpu else ("CPU" if image_urls else "无媒体")
+                print(f"[AI蛮子] GGUF 已加载：{mode}；主模型 GPU 层：{layer_text}；视觉编码器：{vision_text}")
+                key = model_prefix + (context_tokens, f"{mode}/{vision_text}", layers)
+                _LLAMA_CPP_MODELS[key] = llm
+                break
+            except Exception as exc:
+                last_error = exc
+                if candidate is not None:
+                    try:
+                        candidate.close()
+                    except Exception:
+                        pass
+                del handler
+                gc.collect()
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if (layers != 0 or vision_gpu) and _gpu_retryable_error(exc):
+                    print(f"[AI蛮子] GPU 加载未成功，自动降低 GPU 占用后重试：{exc}")
+                    continue
+                raise RuntimeError(f"GGUF 模型加载失败：{exc}") from exc
+        if llm is None:
+            raise RuntimeError(f"GGUF 模型加载失败：{last_error}") from last_error
     content: list[dict[str, Any]] = [{"type": "text", "text": instruction}]
     content.extend({"type": "image_url", "image_url": {"url": item}} for item in image_urls)
+    final_cache_key = _visual_cache_key(
+        "llamacpp-output-v1",
+        image_urls,
+        _path_identity(model_path),
+        _path_identity(mmproj),
+        instruction,
+        thinking,
+        context_tokens,
+        allow_reasoning,
+        observation_mode,
+        inference_strategy,
+        seed,
+    )
+    cached_answer = _final_cache_get(final_cache_key)
+    if cached_answer is not None:
+        print("[AI蛮子] 完全相同的 GGUF 请求缓存命中，跳过重复生成。")
+        return cached_answer
     try:
+        _throw_if_interrupted()
+        # Keep n_tokens intact: llama.cpp compares the next prompt with its current
+        # token history and reuses the longest KV prefix. Exact fixed-seed requests
+        # are served by the result cache above, preserving reproducibility without
+        # disabling native prefix reuse for changed prompts.
+        llm.set_seed(seed)
         result = llm.create_chat_completion(
             messages=[
                 {
@@ -1012,15 +1606,23 @@ def _llamacpp_chat(
                             "不得把模板中的示例描述当成画面内容，也绝不能要求用户再次上传媒体。"
                             if image_urls else ""
                         )
+                        + " " + strategy_instruction
                     ),
                 },
                 {"role": "user", "content": content if image_urls else instruction},
             ],
-            temperature=0.7,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
             max_tokens=None,
         )
-        return _clean_answer(result["choices"][0]["message"]["content"], allow_reasoning)
+        _throw_if_interrupted()
+        answer = _clean_answer(result["choices"][0]["message"]["content"], allow_reasoning)
+        if answer:
+            _final_cache_put(final_cache_key, answer)
+        return answer
     except ValueError as exc:
+        _throw_if_interrupted()
         message = str(exc)
         match = re.search(r"Requested tokens \((\d+)\) exceed context window", message)
         if match:
@@ -1029,15 +1631,23 @@ def _llamacpp_chat(
             if next_context > context_tokens:
                 # The exact chat template can be longer than the pre-load estimate. Reload once at
                 # the required size rather than forcing users to choose a context manually.
-                loaded = _LLAMA_CPP_MODELS.pop(key, None)
+                loaded = _LLAMA_CPP_MODELS.pop(key, None) if key is not None else None
                 try:
                     if loaded is not None:
                         loaded.close()
                 except Exception:
                     pass
                 return _llamacpp_chat(
-                    model_path, instruction, image_urls, mmproj, thinking, next_context, allow_reasoning,
+                    model_path,
+                    instruction,
+                    image_urls,
+                    mmproj,
+                    thinking,
+                    next_context,
+                    allow_reasoning,
                     observation_mode,
+                    inference_strategy,
+                    seed,
                 )
             raise RuntimeError(
                 f"GGUF 输入需要至少 {required_tokens} tokens，已达到模型/硬件自动上下文上限 "
@@ -1045,13 +1655,8 @@ def _llamacpp_chat(
             ) from exc
         raise RuntimeError(f"GGUF 推理失败：{exc}") from exc
     except Exception as exc:
+        _throw_if_interrupted()
         raise RuntimeError(f"GGUF 推理失败：{exc}") from exc
-
-
-def _template_files() -> list[str]:
-    # Kept for backward-compatible imports. The node itself deliberately uses STRING instead
-    # of a COMBO so ComfyUI does not reject an already-uploaded/legacy filename at validation.
-    return ["点击上传 TXT/MD 文件"]
 
 
 def _decode_template_text(data: bytes, label: str) -> str:
@@ -1079,22 +1684,29 @@ def _safe_skill_member(info: zipfile.ZipInfo) -> PurePosixPath:
     return member
 
 
-def _skill_frontmatter(skill_text: str) -> tuple[str, str]:
-    if not skill_text.startswith("---"):
-        return "", ""
-    match = re.match(r"^---\s*\r?\n(.*?)\r?\n---(?:\s*\r?\n|$)", skill_text, re.DOTALL)
-    if not match:
-        return "", ""
-    header = match.group(1)
-    name_match = re.search(r"(?m)^name\s*:\s*[\"']?([^\r\n\"']+)", header)
-    description_match = re.search(r"(?m)^description\s*:\s*[\"']?([^\r\n\"']+)", header)
-    return (
-        name_match.group(1).strip() if name_match else "",
-        description_match.group(1).strip() if description_match else "",
-    )
+def _template_payload(core: str, references: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "core_text": core,
+        "references": references,
+    }
 
 
-def _read_skill_archive(path: Path) -> str:
+def _flatten_template_payload(payload: dict[str, Any]) -> str:
+    """Build the one and only text shown by the loader and sent to the model."""
+    text = str(payload.get("core_text", "")).strip()
+    references = payload.get("references", [])
+    if isinstance(references, list):
+        for item in references:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip() or "未命名资料"
+            content = str(item.get("text", "")).strip()
+            if content:
+                text += f"\n\n[Skill 参考资料：{name}]\n{content}"
+    return text.strip()
+
+
+def _read_skill_archive(path: Path) -> dict[str, Any]:
     try:
         archive = zipfile.ZipFile(path)
     except (OSError, zipfile.BadZipFile) as exc:
@@ -1126,9 +1738,7 @@ def _read_skill_archive(path: Path) -> str:
             raise ValueError("SKILL.md 超过 1 MiB 安全上限。")
         skill_text = _decode_template_text(archive.read(entry_info), entry_name)
         skill_root = PurePosixPath(entry_name).parent
-        name, description = _skill_frontmatter(skill_text)
-
-        references: list[tuple[str, str]] = []
+        references: list[dict[str, str]] = []
         text_bytes = len(skill_text.encode("utf-8"))
         for member_name, info in sorted(safe_members.items()):
             member = PurePosixPath(member_name)
@@ -1148,34 +1758,42 @@ def _read_skill_archive(path: Path) -> str:
                 continue
             data = archive.read(info)
             if text_bytes + len(data) > SKILL_MAX_TEXT_BYTES:
-                break
+                raise ValueError("Skill 文本资料总量超过 8 MiB 安全上限。")
             content = _decode_template_text(data, member_name)
-            references.append((relative.as_posix(), content))
-            text_bytes += len(content.encode("utf-8"))
+            references.append({"name": relative.as_posix(), "text": content})
+            text_bytes += len(data)
 
-    sections = [
-        "[Skill 元数据]",
-        f"名称：{name or PurePosixPath(entry_name).parent.name or path.stem}",
-        f"描述：{description or '未提供'}",
-        f"入口：{entry_name}",
-        "",
-        "[Skill 核心指令]",
-        skill_text,
-    ]
-    for reference_name, content in references:
-        sections.extend(("", f"[Skill 参考资料：{reference_name}]", content))
-    return "\n".join(sections).strip()
+    return _template_payload(skill_text, references)
 
 
-def _read_template_or_skill(path: Path) -> str:
+def _read_template_or_skill_uncached(path: Path) -> dict[str, Any]:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".md", ".markdown"}:
         if path.stat().st_size > SKILL_MAX_TEXT_BYTES:
             raise ValueError("模板文件超过 8 MiB 安全上限。")
-        return _decode_template_text(path.read_bytes(), path.name)
+        text = _decode_template_text(path.read_bytes(), path.name)
+        return _template_payload(text, [])
+    if suffix == ".skill" and not zipfile.is_zipfile(path):
+        if path.stat().st_size > SKILL_MAX_TEXT_BYTES:
+            raise ValueError("Skill 文本文件超过 8 MiB 安全上限。")
+        text = _decode_template_text(path.read_bytes(), path.name)
+        return _template_payload(text, [])
     if suffix in {".skill", ".zip"}:
         return _read_skill_archive(path)
     raise ValueError("仅支持 txt、md、markdown、skill 或包含 SKILL.md 的 zip 文件。")
+
+
+@functools.lru_cache(maxsize=32)
+def _read_template_cached(path_text: str, modified_ns: int, size: int) -> str:
+    # modified_ns and size intentionally participate in the cache key so replacing an
+    # uploaded file with the same name cannot return stale content.
+    del modified_ns, size
+    return _flatten_template_payload(_read_template_or_skill_uncached(Path(path_text)))
+
+
+def _read_template_or_skill(path: Path) -> str:
+    stat = path.stat()
+    return _read_template_cached(str(path.resolve()), stat.st_mtime_ns, stat.st_size)
 
 
 class AIManziMultimodalPrompt:
@@ -1190,6 +1808,13 @@ class AIManziMultimodalPrompt:
             "required": {
                 # Keep the user prompt at the top of the node. All runtime/model knobs follow it.
                 "文字要求": ("STRING", {"multiline": True, "default": "根据输入内容生成可直接使用的正向提示词。"}),
+                "推理策略": (list(INFERENCE_STRATEGIES), {"default": "普通推理"}),
+                "随机种子": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": SEED_MAX,
+                    "control_after_generate": True,
+                }),
                 "推理方式": (["本地推理", "在线推理"], {"default": "本地推理"}),
                 "在线_API_URL": ("STRING", {"default": "https://api.openai.com/v1"}),
                 "在线_API_Key": ("STRING", {"default": "", "password": True}),
@@ -1213,21 +1838,36 @@ class AIManziMultimodalPrompt:
         }
 
     def generate(self, **kwargs):
+        request_started = time.perf_counter()
+        _throw_if_interrupted()
         inference_mode = str(kwargs.get("推理方式", "本地推理"))
         use_online = inference_mode == "在线推理"
         use_ninfer = bool(kwargs["启用_ninfer"])
         thinking = bool(kwargs.get("启用思考模式", True))
         unload_after = bool(kwargs.get("推理后卸载模型", False))
-        instruction = str(kwargs.get("文字要求", "")).strip()
+        inference_strategy = str(kwargs.get("推理策略", "普通推理"))
+        if inference_strategy not in INFERENCE_STRATEGIES:
+            inference_strategy = "普通推理"
+        seed = int(kwargs.get("随机种子", 0)) & SEED_MAX
+        print(f"[AI蛮子] 后端收到本轮种子：{seed}（{inference_strategy}）")
+        user_instruction = str(kwargs.get("文字要求", "")).strip()
+        instruction = user_instruction
         # Decide this from the user's own text before appending templates or
         # machine-generated visual facts, so a Skill cannot expose chain-of-thought.
-        allow_reasoning = _user_requests_reasoning(instruction)
-        source_text = str(kwargs.get("模板输入", "")).strip()
-        if source_text:
-            instruction += (
-                "\n\n以下是用户提供的模板/Skill 指令。将其作为提示词生成规则使用；"
-                "其中的示例不得覆盖输入图像、视频或用户明确要求：\n" + source_text
+        allow_reasoning = _user_requests_reasoning(user_instruction)
+        template_value = kwargs.get("模板输入")
+        template_text = str(template_value or "").strip()
+        if template_text:
+            # The loader's visible parsed text is the sole template value. Do not
+            # reopen, select, summarize or otherwise rewrite it in this node.
+            instruction = (
+                "以下是用户提供的模板/Skill 原文规则。完整遵守这些规则；其中的示例不得覆盖"
+                "本次媒体事实或用户的明确要求：\n"
+                + template_text
+                + "\n\n[用户本次要求]\n"
+                + user_instruction
             )
+        template_ready = time.perf_counter()
         image_urls: list[str] = []
         # NInfer media is grounded by the Qwen bridge at about 1MP per item.
         # Apply that cap while converting the Comfy tensor, not after creating
@@ -1238,6 +1878,7 @@ class AIManziMultimodalPrompt:
             (item for item in kwargs if re.fullmatch(r"图像_\d+", item) and int(item.split("_")[-1]) <= MAX_DYNAMIC_IMAGE_INPUTS),
             key=lambda item: int(item.split("_")[-1]),
         ):
+            _throw_if_interrupted()
             value = kwargs.get(key)
             if value is None:
                 continue
@@ -1245,7 +1886,9 @@ class AIManziMultimodalPrompt:
             if (torch is not None and isinstance(value, torch.Tensor) and value.ndim == 4) or (
                 isinstance(value, np.ndarray) and value.ndim == 4
             ):
-                image_urls.extend(_tensor_data_url(value[index], input_item_pixels) for index in range(value.shape[0]))
+                for index in range(value.shape[0]):
+                    _throw_if_interrupted()
+                    image_urls.append(_tensor_data_url(value[index], input_item_pixels))
             else:
                 image_urls.append(_tensor_data_url(value, input_item_pixels))
         video_urls: list[str] = []
@@ -1257,6 +1900,7 @@ class AIManziMultimodalPrompt:
                 video_frames,
                 str(kwargs.get("视频分析精度", "标准（最多64帧）")),
             )
+        media_ready = time.perf_counter()
         backend_kind: str | None = None
         try:
             if use_online:
@@ -1273,10 +1917,19 @@ class AIManziMultimodalPrompt:
                         video_urls,
                         video_indexes,
                         video_total_frames,
-                        instruction,
-                        lambda prompt, media: _api_chat(
-                            api_base, model_id, prompt, media, False, api_key, True
+                        user_instruction,
+                        lambda prompt, media, segment_seed: _api_chat(
+                            api_base,
+                            model_id,
+                            prompt,
+                            media,
+                            False,
+                            api_key,
+                            True,
+                            "普通推理",
+                            segment_seed,
                         ),
+                        0,
                     )
                     instruction += (
                         "\n\n以下是视觉模型按原始时间顺序对视频各段的观察记录。"
@@ -1295,6 +1948,9 @@ class AIManziMultimodalPrompt:
                     image_urls,
                     allow_reasoning,
                     api_key,
+                    False,
+                    inference_strategy,
+                    seed,
                 )
             else:
                 model, mmproj = _validate_model(
@@ -1311,14 +1967,23 @@ class AIManziMultimodalPrompt:
                             video_urls,
                             video_indexes,
                             video_total_frames,
-                            instruction,
-                            lambda prompt, media: _llamacpp_chat(
+                            user_instruction,
+                            lambda prompt, media, segment_seed: _llamacpp_chat(
                                 bridge_model,
                                 prompt,
                                 _resize_media_to_budget(media, 4 * 1024 * 1024, 768 * 768),
                                 bridge_mmproj,
                                 False,
                                 observation_mode=True,
+                                inference_strategy="普通推理",
+                                seed=segment_seed,
+                            ),
+                            0,
+                            cache_namespace=(
+                                "ninfer-video-bridge-v1|"
+                                + _path_identity(bridge_model)
+                                + "|"
+                                + _path_identity(bridge_mmproj)
                             ),
                         )
                         instruction += (
@@ -1327,7 +1992,7 @@ class AIManziMultimodalPrompt:
                             "默认只输出最终视频提示词：\n" + video_facts
                         )
                     if image_urls:
-                        visual_facts = _ninfer_visual_facts(instruction, image_urls)
+                        visual_facts = _ninfer_visual_facts(user_instruction, image_urls, seed)
                         instruction += (
                             "\n\n以下内容由视觉桥接模型从本次输入图像/视频像素中提取，"
                             "是生成结果时必须遵守的画面事实。不得声称未收到媒体，也不得用模板示例覆盖这些事实：\n"
@@ -1337,20 +2002,42 @@ class AIManziMultimodalPrompt:
                     # Close any cached llama.cpp model before NInfer reserves
                     # host/device memory. Media bridges have completed by here.
                     _unload_plugin_model(None)
-                    # ComfyUI intentionally keeps recently used diffusion/CLIP/VAE models
-                    # resident. NInfer's 27B loader requires nearly all of a 16 GiB GPU,
-                    # so release those managed allocations before starting the engine.
-                    _release_comfy_vram_for_ninfer()
-                    context_tokens = _auto_context_tokens(instruction, 0)
-                    _ensure_server("ninfer", model, False, thinking=thinking, context_tokens=context_tokens)
+                    context_tokens = _ninfer_context_tokens(instruction, thinking)
+                    _ensure_ninfer_server(model, False, thinking=thinking, context_tokens=context_tokens)
                     api_base = _settings()["ninfer_api_base"]
-                    answer = _api_chat(
-                        api_base,
-                        _server_model_id(api_base, model.name),
-                        instruction,
-                        [],
-                        allow_reasoning,
-                    )
+                    try:
+                        answer = _api_chat(
+                            api_base,
+                            _server_model_id(api_base, model.name),
+                            instruction,
+                            [],
+                            allow_reasoning,
+                            inference_strategy=inference_strategy,
+                            seed=seed,
+                        )
+                    except RuntimeError as exc:
+                        if "[empty_final_after_reasoning]" not in str(exc) or not thinking:
+                            raise
+                        retry_context = min(AUTO_CONTEXT_MAX, max(32768, context_tokens * 2))
+                        if retry_context <= context_tokens:
+                            raise RuntimeError(
+                                "NInfer 已达到最大上下文，但思考过程仍未生成最终答案。"
+                                "请关闭思考模式或缩短模板。"
+                            ) from exc
+                        print(
+                            f"[AI蛮子] NInfer 思考耗尽 {context_tokens} 上下文，"
+                            f"自动扩容到 {retry_context} 并重试一次。"
+                        )
+                        _ensure_ninfer_server(model, False, thinking=thinking, context_tokens=retry_context)
+                        answer = _api_chat(
+                            api_base,
+                            _server_model_id(api_base, model.name),
+                            instruction,
+                            [],
+                            allow_reasoning,
+                            inference_strategy=inference_strategy,
+                            seed=seed,
+                        )
                 else:
                     backend_kind = "llama_cpp"
                     if video_urls:
@@ -1358,14 +2045,24 @@ class AIManziMultimodalPrompt:
                             video_urls,
                             video_indexes,
                             video_total_frames,
-                            instruction,
-                            lambda prompt, media: _llamacpp_chat(
+                            user_instruction,
+                            lambda prompt, media, segment_seed: _llamacpp_chat(
                                 model,
                                 prompt,
                                 _resize_media_to_budget(media, 4 * 1024 * 1024, 768 * 768),
                                 mmproj,
                                 thinking,
                                 observation_mode=True,
+                                inference_strategy="普通推理",
+                                seed=segment_seed,
+                            ),
+                            0,
+                            cache_namespace=(
+                                "gguf-video-v1|"
+                                + _path_identity(model)
+                                + "|"
+                                + _path_identity(mmproj)
+                                + f"|thinking={thinking}"
                             ),
                         )
                         instruction += (
@@ -1375,14 +2072,65 @@ class AIManziMultimodalPrompt:
                         )
                     image_urls = _resize_media_to_budget(image_urls, VISION_SAFE_TOTAL_PIXELS)
                     answer = _llamacpp_chat(
-                        model, instruction, image_urls, mmproj, thinking, allow_reasoning=allow_reasoning
+                        model,
+                        instruction,
+                        image_urls,
+                        mmproj,
+                        thinking,
+                        allow_reasoning=allow_reasoning,
+                        inference_strategy=inference_strategy,
+                        seed=seed,
                     )
         finally:
             if unload_after:
                 _unload_plugin_model(backend_kind)
         if not answer:
             raise RuntimeError("模型没有返回正向提示词。")
+        finished = time.perf_counter()
+        print(
+            f"[AI蛮子] 本轮耗时：模板解析 {template_ready - request_started:.3f}s，"
+            f"媒体预处理 {media_ready - template_ready:.3f}s，"
+            f"引擎推理 {finished - media_ready:.3f}s，总计 {finished - request_started:.3f}s。"
+        )
         return (answer,)
+
+
+def _resolve_uploaded_template(selected_file: str) -> Path:
+    if not selected_file.strip() or selected_file == "点击上传 TXT/MD 文件" or folder_paths is None:
+        raise ValueError("请使用节点上的上传按钮选择模板或 Skill 文件。")
+    root = Path(folder_paths.get_input_directory()).resolve()
+    path = (root / selected_file).resolve()
+    if root not in path.parents or not path.is_file():
+        raise ValueError("模板/Skill 文件无效或不在 ComfyUI/input 目录中。")
+    return path
+
+
+async def _parse_template_route(request: Any) -> Any:
+    try:
+        body = await request.json()
+        selected_file = str(body.get("file", ""))
+        path = _resolve_uploaded_template(selected_file)
+        text = _read_template_or_skill(path)
+        if not text.strip():
+            raise ValueError("模板/Skill 解析后没有可提交的文字内容。")
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        print(
+            f"[AI蛮子] 模板已解析：{path.name}；最终 {len(text)} 字符；"
+            f"SHA256 {digest[:12]}。"
+        )
+        return web.json_response({
+            "ok": True,
+            "file": selected_file,
+            "content": text,
+            "characters": len(text),
+            "sha256": digest,
+        })
+    except (ValueError, OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+
+if PromptServer is not None and web is not None and getattr(PromptServer, "instance", None) is not None:
+    PromptServer.instance.routes.post("/aimanzi/parse-template")(_parse_template_route)
 
 
 class AIManziReadText:
@@ -1397,18 +2145,25 @@ class AIManziReadText:
         # Do not use image_upload here: ComfyUI then filters the chooser to image formats.
         # Keep the serialized key for compatibility with existing workflows; the
         # node title and upload button communicate the expanded Skill support.
-        return {"required": {"TXT/MD 文件": ("STRING", {"default": ""})}}
+        return {"required": {
+            "TXT/MD 文件": ("STRING", {"default": ""}),
+            "提交给模型的内容": ("STRING", {"multiline": True, "default": ""}),
+        }}
 
     def read(self, **kwargs):
         # Accept the former widget key so saved workflows continue to execute.
+        if "提交给模型的内容" in kwargs:
+            content = str(kwargs.get("提交给模型的内容", "")).strip()
+            if not content:
+                raise ValueError("解析内容为空。请重新上传模板/Skill，或在内容框中输入文字。")
+            return (content,)
+        # Compatibility fallback for workflows saved before immediate parsing.
         selected_file = str(kwargs.get("模板/Skill 文件", kwargs.get("TXT/MD 文件", "")))
-        if not selected_file.strip() or selected_file == "点击上传 TXT/MD 文件" or folder_paths is None:
-            raise ValueError("请使用节点上的上传按钮选择模板或 Skill 文件。")
-        root = Path(folder_paths.get_input_directory()).resolve()
-        path = (root / selected_file).resolve()
-        if root not in path.parents or not path.is_file():
-            raise ValueError("模板/Skill 文件无效或不在 ComfyUI/input 目录中。")
-        return (_read_template_or_skill(path),)
+        path = _resolve_uploaded_template(selected_file)
+        content = _read_template_or_skill(path)
+        if not content.strip():
+            raise ValueError("模板/Skill 解析后没有可提交的文字内容。")
+        return (content,)
 
 
 NODE_CLASS_MAPPINGS = {
