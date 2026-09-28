@@ -1,4 +1,5 @@
 import { app } from "/scripts/app.js";
+import { api } from "/scripts/api.js";
 
 const NODE = "AIManziMultimodalPrompt";
 const TEMPLATE_NODE = "AIManziReadText";
@@ -105,6 +106,27 @@ function prepareSeedForQueue(node, graphData) {
     }
     node.setDirtyCanvas?.(true, true);
     console.info(`[AI蛮子] 本轮实际种子：${queued}（${mode}）`);
+}
+
+function installSeedQueueHook() {
+    if (typeof api.queuePrompt !== "function" || api.queuePrompt.__aimanziSeedHook) return;
+    const originalQueuePrompt = api.queuePrompt;
+    const wrapped = async function (...args) {
+        // Current ComfyUI sends {output, workflow} to api.queuePrompt. Locate it
+        // by shape so minor frontend signature changes do not break seed control.
+        const graphData = args.find((value) => value && typeof value === "object"
+            && value.output && value.workflow);
+        if (graphData) {
+            for (const node of app.graph?._nodes ?? []) {
+                if (node.comfyClass === NODE && node.mode !== 2 && node.mode !== 4) {
+                    prepareSeedForQueue(node, graphData);
+                }
+            }
+        }
+        return originalQueuePrompt.apply(this, args);
+    };
+    wrapped.__aimanziSeedHook = true;
+    api.queuePrompt = wrapped;
 }
 
 function refreshTemplateLayout(node) {
@@ -231,13 +253,8 @@ function dynamicImageInputs(node) {
 
 app.registerExtension({
     name: "AIManzi.MultimodalPrompt",
-    async beforeQueuePrompt(graphData) {
-        for (const node of app.graph?._nodes ?? []) {
-            if (node.comfyClass === NODE && node.mode !== 2 && node.mode !== 4) {
-                prepareSeedForQueue(node, graphData);
-            }
-        }
-        return graphData;
+    setup() {
+        installSeedQueueHook();
     },
     nodeCreated(node) {
         if (node.comfyClass === TEMPLATE_NODE) {

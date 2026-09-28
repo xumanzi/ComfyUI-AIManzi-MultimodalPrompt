@@ -349,6 +349,16 @@ def _inference_profile(strategy: str, observation_mode: bool = False) -> tuple[f
     )
 
 
+def _creative_seed_instruction(strategy: str, observation_mode: bool, seed: int) -> str:
+    if observation_mode or strategy != "创新推理":
+        return ""
+    return (
+        f" 本轮创意变化编号为 {int(seed) & SEED_MAX}。在不违反用户指定格式、模板硬性规则和媒体事实的前提下，"
+        "使用该编号驱动本轮独立的创意路径，主动改变细节选择、描述顺序、构图重点、镜头表达和氛围组织；"
+        "不要机械复用上一轮的句式与结构。相同编号应尽量保持可复现。"
+    )
+
+
 def _server_model_id(api_base: str, fallback: str) -> str:
     """NInfer exposes its artifact model id; use it instead of the local filename."""
     cached = _SERVER_MODEL_IDS.get(api_base)
@@ -1074,8 +1084,9 @@ def _api_chat(
     inference_strategy: str = "普通推理",
     seed: int = 0,
 ) -> str:
-    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
     seed = int(seed) & SEED_MAX
+    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
+    strategy_instruction += _creative_seed_instruction(inference_strategy, observation_mode, seed)
     parsed_base = urlsplit(api_base)
     local_service = parsed_base.hostname in {"127.0.0.1", "localhost", "::1"}
     response_cache_key = None
@@ -1467,8 +1478,9 @@ def _llamacpp_chat(
         from llama_cpp.llama_chat_format import Qwen3VLChatHandler, Qwen35ChatHandler
     except ImportError as exc:
         raise RuntimeError("关闭 NInfer 的 GGUF 推理需要 ComfyUI Python 中的 llama-cpp-python。") from exc
-    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
     seed = int(seed) & SEED_MAX
+    temperature, top_p, strategy_instruction = _inference_profile(inference_strategy, observation_mode)
+    strategy_instruction += _creative_seed_instruction(inference_strategy, observation_mode, seed)
     context_tokens = context_tokens or _auto_context_tokens(instruction, len(image_urls))
     model_prefix = (str(model_path), str(mmproj or ""), thinking)
     key: tuple[str, str, bool, int, str, int] | None = None
