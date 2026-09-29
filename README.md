@@ -91,11 +91,13 @@ git lfs pull
 你的ComfyUI目录\models\LLM
 ```
 
+插件不会保存或写死 `C:`、`D:`、`G:` 等盘符。它会在每次启动时读取当前正在运行的 ComfyUI 模型目录，因此移动 ComfyUI、换盘，或使用 `--models-directory` 指定其他模型目录后，都会自动跟随新的 `models\LLM`。主模型与 mmproj 辅助模型都会扫描该目录及其子目录；旧版 `settings.json` 中遗留的绝对路径会被自动忽略。
+
 支持的模型：
 
 - `.ninfer`：仅在开启“启用 NInfer”时使用，适合支持的 RTX 40/50 系显卡。
 - `.gguf`：关闭 NInfer 后使用，兼容范围更广。
-- 视觉 GGUF：要识别图片或视频，主模型和匹配的 `mmproj*.gguf` 必须放在同一文件夹。
+- 视觉 GGUF：要识别图片或视频，还需要匹配的 `mmproj*.gguf`。建议与主模型放在同一文件夹，以便准确自动匹配；也可以放在 `models\LLM` 的其他子目录后，在节点的 `mmproj` 选项中手动选择。
 
 本节点不支持直接加载 `.safetensors` 扩散模型或文本编码器。
 

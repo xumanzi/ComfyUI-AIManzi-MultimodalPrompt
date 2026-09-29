@@ -108,18 +108,18 @@ class _DynamicImageOptionalInputs(dict):
 
 
 def _settings() -> dict[str, Any]:
-    default_llm_root = (
-        Path(folder_paths.models_dir) / "LLM"
-        if folder_paths is not None and getattr(folder_paths, "models_dir", None)
-        else Path.cwd() / "models" / "LLM"
-    )
     defaults: dict[str, Any] = {
-        "llm_roots": [str(default_llm_root)],
         "ninfer_api_base": "http://127.0.0.1:8080/v1",
         "request_timeout_seconds": 600,
     }
     try:
-        defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            # Older builds allowed llm_roots in settings.json. That persisted an
+            # absolute drive path when the plugin was copied to another ComfyUI.
+            # Model discovery is now always owned by the running ComfyUI instance.
+            saved.pop("llm_roots", None)
+            defaults.update(saved)
     except (OSError, json.JSONDecodeError):
         pass
     return defaults
@@ -158,13 +158,25 @@ def _ninfer_context_tokens(text: str, thinking: bool) -> int:
     return max(context, 16384 if thinking else AUTO_CONTEXT_MIN)
 
 
+def _comfy_llm_root() -> Path:
+    """Return this process's ComfyUI/models/LLM without persisting a drive letter."""
+    if folder_paths is not None and getattr(folder_paths, "models_dir", None):
+        # abspath keeps ComfyUI's logical path. Path.resolve() follows Windows
+        # junctions/symlinks and can unexpectedly turn `ComfyUI/models` into a
+        # different physical drive, which looks like a hard-coded model path.
+        return Path(os.path.abspath(folder_paths.models_dir)) / "LLM"
+    # Standalone import fallback used only outside ComfyUI (for diagnostics/tests).
+    return (Path(__file__).resolve().parents[2] / "models" / "LLM")
+
+
 def _roots() -> list[Path]:
-    result: list[Path] = []
-    for item in _settings()["llm_roots"]:
-        path = Path(item)
-        if path.exists():
-            result.append(path)
-    return result
+    root = _comfy_llm_root()
+    if root.is_dir():
+        return [root]
+    # Accept a lowercase folder on case-sensitive systems while keeping Windows'
+    # documented `models/LLM` location as the canonical path.
+    lowercase = root.parent / "llm"
+    return [lowercase] if lowercase.is_dir() else []
 
 
 @functools.lru_cache(maxsize=1)
@@ -225,10 +237,10 @@ def _resolve_model(choice: str, use_ninfer: bool = False) -> Path:
             return preferred[0]
         if candidates:
             return candidates[0]
-        raise ValueError("自动匹配未找到可用模型。")
+        raise ValueError(f"自动匹配未找到可用模型。请放入当前 ComfyUI 的 {_comfy_llm_root()}。")
     matches = [Path(item) for item in _scan_models() if _display_model_name(Path(item)) == choice]
     if not matches:
-        raise ValueError("请选择有效的模型。")
+        raise ValueError(f"请选择有效的模型。当前扫描目录：{_comfy_llm_root()}。")
     if len(matches) > 1:
         raise ValueError(f"发现同名模型“{choice}”，请移除重复文件后重启 ComfyUI。")
     return matches[0]
@@ -1363,7 +1375,13 @@ def _video_facts_from_frames(
 
 def _find_mmproj(model_path: Path) -> Path | None:
     candidates = sorted(model_path.parent.glob("*mmproj*.gguf"))
-    return candidates[0] if candidates else None
+    if candidates:
+        return candidates[0]
+    # The documented layout allows both files anywhere below models/LLM. If the
+    # projector is stored in a sibling subfolder, use it automatically only when
+    # the choice is unambiguous; otherwise the user selects it from the mmproj list.
+    shared = [Path(item) for item in _mmproj_files()]
+    return shared[0] if len(shared) == 1 else None
 
 
 def _find_visual_bridge_model() -> tuple[Path, Path]:
@@ -1376,7 +1394,7 @@ def _find_visual_bridge_model() -> tuple[Path, Path]:
     """
     candidates: list[tuple[int, Path, Path]] = []
     for model_name in _scan_models():
-        path = Path(model_name).resolve()
+        path = Path(model_name)
         if path.suffix.lower() != ".gguf" or "mmproj" in path.name.lower():
             continue
         mmproj = _find_mmproj(path)
@@ -1451,7 +1469,10 @@ def _validate_model(model: str, use_ninfer: bool, has_media: bool, selected_mmpr
         if path.suffix.lower() == ".gguf":
             mmproj = _resolve_mmproj(selected_mmproj, path)
         if path.suffix.lower() == ".gguf" and mmproj is None:
-            raise ValueError("视觉 GGUF 模型缺少同目录 mmproj*.gguf，不能处理图像或视频。")
+            raise ValueError(
+                "视觉 GGUF 模型缺少匹配的 mmproj*.gguf，不能处理图像或视频。"
+                f"请把辅助模型放入 {_comfy_llm_root()} 或其子目录，并在 mmproj 选项中选择。"
+            )
     return path, mmproj
 
 
